@@ -38,8 +38,9 @@ Use /tdd to complete the task.
 
 Before committing, run the feedback loops:
 
-- `npm run test` to run the tests
-- `npm run typecheck` to run the type checker
+- `cargo test` to run the tests
+- `cargo clippy` to run the linter
+- `cargo build` to verify the project compiles
 
 # COMMIT
 
