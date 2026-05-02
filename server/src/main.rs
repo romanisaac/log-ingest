@@ -653,6 +653,149 @@ mod tests {
         assert_eq!(rows.len(), N, "expected {N} events after re-consumption, got {}", rows.len());
     }
 
+    /// Verify that no events are lost when a second consumer joins the same group,
+    /// triggering a Kafka rebalance that forces the first consumer to flush its
+    /// buffered-but-not-yet-threshold events via the `pre_rebalance` callback.
+    ///
+    /// Requires the Docker Compose stack: `make up`
+    /// Run with: cargo test -p server -- --ignored rebalance
+    #[tokio::test]
+    #[ignore]
+    async fn rebalance_flushes_without_data_loss() {
+        use rdkafka::config::ClientConfig as RdkConfig;
+        use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
+        use std::collections::HashSet;
+
+        const N: usize = 6;
+        let topic = format!("test-rebalance-{}", uuid::Uuid::new_v4());
+        let group_id = format!("grp-rebalance-{}", uuid::Uuid::new_v4());
+
+        // Use a large batch size so events won't flush by size threshold.
+        // We rely on the rebalance callback (or the 1 s age trigger) to flush.
+        const BATCH_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+        let producer: BaseProducer = RdkConfig::new()
+            .set("bootstrap.servers", "localhost:9092")
+            .set("message.timeout.ms", "5000")
+            .create()
+            .unwrap();
+
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+
+        for i in 0..N {
+            let event = serde_json::json!({
+                "timestamp": now_ns + i as i64,
+                "level": "INFO",
+                "service": "rebalance-test",
+                "message": "rebalance test event",
+                "kafka_partition": 0,
+                "kafka_offset": i,
+                "attributes": {}
+            });
+            producer
+                .send(
+                    BaseRecord::to(&topic)
+                        .payload(&event.to_string())
+                        .key(&format!("{i}")),
+                )
+                .expect("send failed");
+        }
+        producer.flush(Duration::from_secs(5)).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let manifest = Arc::new(Mutex::new(
+            Manifest::open(&dir.path().join("manifest.db")).unwrap(),
+        ));
+
+        // Start consumer 1.
+        let (tx1, rx1) = tokio::sync::broadcast::channel::<()>(1);
+        let m1 = Arc::clone(&manifest);
+        let dd1 = data_dir.clone();
+        let gid1 = group_id.clone();
+        let top1 = topic.clone();
+        tokio::spawn(async move {
+            let _ = run_consumer(
+                ConsumerConfig {
+                    bootstrap_servers: "localhost:9092".to_string(),
+                    group_id: gid1,
+                    topic: top1,
+                    batch_max_bytes: BATCH_MAX_BYTES,
+                },
+                dd1,
+                m1,
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(Semaphore::new(4)),
+                rx1,
+            )
+            .await;
+        });
+
+        // Give consumer 1 time to receive and buffer the events (but less than the
+        // 1 s age trigger so they stay in the buffer when consumer 2 joins).
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Start consumer 2 with the same group — triggers a rebalance.
+        // Consumer 1's pre_rebalance callback will flush its buffer before yielding.
+        let (tx2, rx2) = tokio::sync::broadcast::channel::<()>(1);
+        let m2 = Arc::clone(&manifest);
+        let dd2 = data_dir.clone();
+        let gid2 = group_id.clone();
+        let top2 = topic.clone();
+        tokio::spawn(async move {
+            let _ = run_consumer(
+                ConsumerConfig {
+                    bootstrap_servers: "localhost:9092".to_string(),
+                    group_id: gid2,
+                    topic: top2,
+                    batch_max_bytes: BATCH_MAX_BYTES,
+                },
+                dd2,
+                m2,
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(Semaphore::new(4)),
+                rx2,
+            )
+            .await;
+        });
+
+        // Allow time for the rebalance and any in-flight flushes to complete.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let _ = tx1.send(());
+        let _ = tx2.send(());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // All N events must be present with no duplicates (unique by kafka_offset).
+        let state = AppState { manifest };
+        let rows = run_query(
+            state,
+            QueryRequest {
+                sql: "SELECT kafka_offset FROM logs ORDER BY kafka_offset".to_string(),
+                time_from: Some(0),
+                time_to: Some(i64::MAX),
+                limit: 1000,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            rows.len(),
+            N,
+            "expected {N} events after rebalance, got {} (data loss or duplication)",
+            rows.len()
+        );
+
+        let offsets: HashSet<i64> = rows
+            .iter()
+            .map(|r| r["kafka_offset"].as_i64().unwrap())
+            .collect();
+        assert_eq!(offsets.len(), N, "duplicate events detected after rebalance");
+    }
+
     /// Verify that buffer backpressure pauses and resumes the Kafka consumer without
     /// dropping events. Uses a tiny batch buffer (500 bytes) so that two events
     /// (~240 bytes each) push occupancy above the 0.8 high-water mark, triggering
