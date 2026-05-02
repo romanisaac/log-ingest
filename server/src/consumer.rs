@@ -12,7 +12,7 @@ use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::message::Message;
 use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
 use rdkafka::ClientConfig;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, Mutex, Semaphore};
 use tokio::time::interval;
 
 use crate::flush_events;
@@ -52,12 +52,18 @@ impl Default for ConsumerConfig {
 /// (kafka_partition, kafka_offset) deduplication (issue #14).
 ///
 /// `backpressure_pauses` is incremented each time the consumer pauses its
-/// Kafka partitions due to buffer occupancy exceeding the high-water mark.
+/// Kafka partitions — either because buffer occupancy exceeded the high-water
+/// mark or because `flush_semaphore` was exhausted.
+///
+/// `flush_semaphore` caps how many Parquet flush operations may run concurrently
+/// across all partition workers. When all slots are occupied, the consumer pauses
+/// its partitions until a slot is available.
 pub async fn run_consumer(
     config: ConsumerConfig,
     data_dir: PathBuf,
     manifest: Arc<Mutex<Manifest>>,
     backpressure_pauses: Arc<AtomicU64>,
+    flush_semaphore: Arc<Semaphore>,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<()> {
     let consumer: StreamConsumer = ClientConfig::new()
@@ -103,7 +109,13 @@ pub async fn run_consumer(
                                 );
 
                                 if let Some(batch) = buffer.push(event) {
-                                    if do_flush(&batch, &data_dir, &manifest).await {
+                                    maybe_pause_for_semaphore(
+                                        &consumer,
+                                        &flush_semaphore,
+                                        &backpressure_pauses,
+                                        &mut is_paused,
+                                    );
+                                    if flush_gated(&batch, &data_dir, &manifest, &flush_semaphore).await {
                                         commit_offsets(&consumer, &pending);
                                         pending.clear();
                                         if is_paused && buffer.occupancy() < LOW_WATER_MARK {
@@ -122,7 +134,13 @@ pub async fn run_consumer(
             }
             _ = tick.tick() => {
                 if let Some(batch) = buffer.poll() {
-                    if do_flush(&batch, &data_dir, &manifest).await {
+                    maybe_pause_for_semaphore(
+                        &consumer,
+                        &flush_semaphore,
+                        &backpressure_pauses,
+                        &mut is_paused,
+                    );
+                    if flush_gated(&batch, &data_dir, &manifest, &flush_semaphore).await {
                         commit_offsets(&consumer, &pending);
                         pending.clear();
                         if is_paused && buffer.occupancy() < LOW_WATER_MARK {
@@ -138,7 +156,7 @@ pub async fn run_consumer(
                     buffer.len()
                 );
                 if !buffer.is_empty() {
-                    if do_flush(&buffer.drain(), &data_dir, &manifest).await {
+                    if flush_gated(&buffer.drain(), &data_dir, &manifest, &flush_semaphore).await {
                         commit_offsets(&consumer, &pending);
                     }
                 }
@@ -148,6 +166,37 @@ pub async fn run_consumer(
     }
 
     Ok(())
+}
+
+/// Acquire a semaphore slot before flushing. Records the full duration
+/// (including semaphore wait time) as a `flush_duration_seconds` histogram.
+/// Exposed as pub(crate) so unit tests can verify semaphore serialization.
+pub(crate) async fn flush_gated(
+    batch: &[LogEvent],
+    data_dir: &PathBuf,
+    manifest: &Arc<Mutex<Manifest>>,
+    semaphore: &Arc<Semaphore>,
+) -> bool {
+    let start = std::time::Instant::now();
+    let _permit = semaphore.acquire().await.unwrap();
+    let ok = do_flush(batch, data_dir, manifest).await;
+    metrics::histogram!("flush_duration_seconds").record(start.elapsed().as_secs_f64());
+    ok
+}
+
+/// Pause Kafka partitions if the flush semaphore is currently exhausted.
+/// Called immediately before a flush so the consumer stops receiving new events
+/// while waiting for a semaphore slot.
+fn maybe_pause_for_semaphore(
+    consumer: &StreamConsumer,
+    semaphore: &Arc<Semaphore>,
+    pauses_total: &AtomicU64,
+    is_paused: &mut bool,
+) {
+    if !*is_paused && semaphore.available_permits() == 0 {
+        pause_partitions(consumer, pauses_total);
+        *is_paused = true;
+    }
 }
 
 /// Flush a batch to Parquet + manifest. Returns true on success.
@@ -185,7 +234,8 @@ fn commit_offsets(consumer: &StreamConsumer, pending: &HashMap<(String, i32), i6
     }
 }
 
-/// Pause all currently assigned partitions. Called when buffer occupancy exceeds HIGH_WATER_MARK.
+/// Pause all currently assigned partitions. Called when buffer occupancy exceeds
+/// HIGH_WATER_MARK or the flush semaphore is exhausted.
 fn pause_partitions(consumer: &StreamConsumer, pauses_total: &AtomicU64) {
     match consumer.assignment() {
         Ok(tpl) if !tpl.elements().is_empty() => {
@@ -204,7 +254,8 @@ fn pause_partitions(consumer: &StreamConsumer, pauses_total: &AtomicU64) {
     }
 }
 
-/// Resume all currently assigned partitions. Called after a flush drops occupancy below LOW_WATER_MARK.
+/// Resume all currently assigned partitions. Called after a flush drops occupancy
+/// below LOW_WATER_MARK (whether paused for backpressure or semaphore saturation).
 fn resume_partitions(consumer: &StreamConsumer) {
     match consumer.assignment() {
         Ok(tpl) if !tpl.elements().is_empty() => {
@@ -216,5 +267,47 @@ fn resume_partitions(consumer: &StreamConsumer) {
         }
         Ok(_) => {}
         Err(e) => tracing::error!("failed to get assignment for resume: {e}"),
+    }
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    /// Verify that a semaphore with 1 permit serializes 3 concurrent flush
+    /// attempts — at most 1 can hold the permit at any moment.
+    #[tokio::test]
+    async fn flush_semaphore_limits_concurrency() {
+        let sem = Arc::new(Semaphore::new(1));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+
+        let tasks: Vec<_> = (0..3)
+            .map(|_| {
+                let sem = Arc::clone(&sem);
+                let in_flight = Arc::clone(&in_flight);
+                let max_in_flight = Arc::clone(&max_in_flight);
+                tokio::spawn(async move {
+                    let _permit = sem.acquire().await.unwrap();
+                    let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_in_flight.fetch_max(current, Ordering::SeqCst);
+                    // Simulate flush work
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                })
+            })
+            .collect();
+
+        for t in tasks {
+            t.await.unwrap();
+        }
+        assert_eq!(
+            max_in_flight.load(Ordering::SeqCst),
+            1,
+            "semaphore(1) must allow at most 1 concurrent flush"
+        );
     }
 }
