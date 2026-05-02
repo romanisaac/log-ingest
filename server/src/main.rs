@@ -321,4 +321,47 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
     }
+
+    /// Requires MinIO running: `make up`
+    /// Run with: cargo test -p server -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn datafusion_reads_parquet_from_minio() {
+        use event_schema::{encode_batch, Level};
+        use object_store::path::Path as ObjPath;
+        use parquet::arrow::ArrowWriter;
+        use storage::{minio_store, MinioConfig};
+        use url::Url;
+
+        let config = MinioConfig::default();
+        let store = minio_store(&config).unwrap();
+
+        // Write a small Parquet file to MinIO.
+        let event = make_event();
+        let batch = encode_batch(&[event]).unwrap();
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let obj_path = ObjPath::from("test/datafusion_test.parquet");
+        store.put(&obj_path, bytes::Bytes::from(buf).into()).await.unwrap();
+
+        // Register the MinIO store with DataFusion and query the file.
+        let ctx = SessionContext::new();
+        let minio_url = Url::parse(&format!("s3://{}", config.bucket)).unwrap();
+        ctx.register_object_store(&minio_url, store.clone());
+        ctx.register_parquet(
+            "logs",
+            &format!("s3://{}/test/datafusion_test.parquet", config.bucket),
+            ParquetReadOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let rows = ctx.sql("SELECT service, level FROM logs").await.unwrap().collect().await.unwrap();
+        assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+
+        store.delete(&obj_path).await.unwrap();
+    }
 }
