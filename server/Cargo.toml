@@ -19,6 +19,8 @@ anyhow = { workspace = true }
 event-schema = { path = "../crates/event-schema" }
 manifest = { path = "../crates/manifest" }
 storage = { path = "../crates/storage" }
+batch-buffer = { path = "../crates/batch-buffer" }
+rdkafka = { version = "0.36", features = ["cmake-build"] }
 
 datafusion = "44"
 parquet = "53.4"
@@ -28,7 +30,6 @@ chrono = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
-batch-buffer = { path = "../crates/batch-buffer" }
 tower = { version = "0.5", features = ["util"] }
 object_store = { version = "0.11", features = ["aws"] }
 url = "2"
