@@ -115,16 +115,14 @@ mod tests {
     }
 
     #[test]
-    fn occupancy_does_not_exceed_one() {
+    fn oversized_event_flushes_immediately() {
+        // An event larger than max_bytes triggers a flush on that same push and
+        // resets the buffer to empty. Occupancy never gets stuck above 1.0.
         let mut buf = BatchBuffer::new(10);
-        // Push an event larger than max_bytes.
-        buf.push(make_event(1000));
-        // After flush the occupancy resets, but before that it should be clamped.
-        // Actually push returns Some() immediately, so let's check before drain.
-        let mut buf2 = BatchBuffer::new(10);
-        buf2.events.push(make_event(1000));
-        buf2.current_bytes = 1027; // manually set above max
-        assert_eq!(buf2.occupancy(), 1.0);
+        let batch = buf.push(make_event(1000)).expect("oversized event should trigger flush");
+        assert_eq!(batch.len(), 1);
+        assert_eq!(buf.occupancy(), 0.0);
+        assert!(buf.is_empty());
     }
 
     #[test]
