@@ -1,16 +1,16 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use arrow::array::{Array, BooleanArray, Int32Array, Int64Array, StringArray, StringViewArray};
 use arrow::datatypes::DataType;
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Json, Router};
 use datafusion::prelude::*;
-use event_schema::LogEvent;
 use manifest::Manifest;
 use serde::Deserialize;
-use server::flush_events;
-use tokio::sync::Mutex;
+use server::{run_consumer, ConsumerConfig};
+use tokio::sync::{broadcast, Mutex};
 
 // ─── HTTP API ────────────────────────────────────────────────────────────────
 
@@ -140,21 +140,54 @@ async fn main() {
         )
         .init();
 
-    let db_path = std::env::var("MANIFEST_PATH").unwrap_or_else(|_| "manifest.db".to_string());
-    let manifest = Manifest::open(Path::new(&db_path)).expect("open manifest");
-    let state = AppState {
-        manifest: Arc::new(Mutex::new(manifest)),
-    };
+    let data_dir = PathBuf::from(
+        std::env::var("DATA_DIR").unwrap_or_else(|_| "data".to_string()),
+    );
+    std::fs::create_dir_all(&data_dir).expect("create data dir");
 
+    let db_path = std::env::var("MANIFEST_PATH").unwrap_or_else(|_| "manifest.db".to_string());
+    let manifest = Arc::new(Mutex::new(
+        Manifest::open(Path::new(&db_path)).expect("open manifest"),
+    ));
+
+    let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
+
+    // Start Kafka consumer as a background task.
+    let consumer_manifest = Arc::clone(&manifest);
+    tokio::spawn(async move {
+        if let Err(e) = run_consumer(
+            ConsumerConfig::default(),
+            data_dir,
+            consumer_manifest,
+            shutdown_rx,
+        )
+        .await
+        {
+            tracing::error!("consumer exited with error: {e:#}");
+        }
+    });
+
+    let state = AppState { manifest };
     let app = Router::new()
         .route("/query", post(query_handler))
         .route("/health", axum::routing::get(|| async { "ok" }))
         .with_state(state);
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
+        .await
+        .unwrap();
     tracing::info!("listening on {}", listener.local_addr().unwrap());
-    axum::serve(listener, app).await.unwrap();
+
+    tokio::select! {
+        _ = axum::serve(listener, app) => {}
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("ctrl-c received, shutting down");
+            let _ = shutdown_tx.send(());
+            // Give the consumer time to drain its buffer before exiting.
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -162,7 +195,8 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use event_schema::{AttributeValue, Level};
+    use event_schema::{AttributeValue, Level, LogEvent};
+    use server::flush_events;
     use std::collections::HashMap;
     use tower::util::ServiceExt;
 
@@ -363,5 +397,87 @@ mod tests {
         assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
 
         store.delete(&obj_path).await.unwrap();
+    }
+
+    /// Full ingest → store → query via real Kafka.
+    /// Requires the Docker Compose stack: `make up`
+    /// Run with: cargo test -p server -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn kafka_ingest_and_query() {
+        use rdkafka::config::ClientConfig;
+        use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
+        use std::time::Duration;
+
+        const TOPIC: &str = "logs-test-integration";
+        const N: usize = 10;
+
+        // Publish N synthetic events to a dedicated test topic.
+        let producer: BaseProducer = ClientConfig::new()
+            .set("bootstrap.servers", "localhost:9092")
+            .set("message.timeout.ms", "5000")
+            .create()
+            .unwrap();
+
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+
+        for i in 0..N {
+            let event = serde_json::json!({
+                "timestamp": now_ns + i as i64,
+                "level": "INFO",
+                "service": "integration-test",
+                "message": "kafka ingest test",
+                "kafka_partition": 0,
+                "kafka_offset": i,
+                "attributes": { "seq": i }
+            });
+            producer
+                .send(BaseRecord::to(TOPIC).payload(&event.to_string()).key(&format!("{i}")))
+                .expect("send failed");
+        }
+        producer.flush(Duration::from_secs(5)).unwrap();
+
+        // Start the consumer and let it run long enough to flush.
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let manifest = Arc::new(Mutex::new(
+            Manifest::open(&dir.path().join("manifest.db")).unwrap(),
+        ));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+
+        let consumer_manifest = Arc::clone(&manifest);
+        let consumer_data_dir = data_dir.clone();
+        tokio::spawn(async move {
+            let _ = run_consumer(
+                ConsumerConfig {
+                    bootstrap_servers: "localhost:9092".to_string(),
+                    group_id: format!("test-{}", uuid::Uuid::new_v4()),
+                    topic: TOPIC.to_string(),
+                },
+                consumer_data_dir,
+                consumer_manifest,
+                shutdown_rx,
+            )
+            .await;
+        });
+
+        // Wait for the time trigger (1s) plus buffer.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let _ = shutdown_tx.send(());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Query and assert all N events are present.
+        let state = AppState { manifest };
+        let req = QueryRequest {
+            sql: "SELECT * FROM logs".to_string(),
+            time_from: Some(0),
+            time_to: Some(i64::MAX),
+            limit: 1000,
+        };
+        let rows = run_query(state, req).await.unwrap();
+        assert_eq!(rows.len(), N, "expected {N} events, got {}", rows.len());
     }
 }
