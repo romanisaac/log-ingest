@@ -8,10 +8,10 @@ use anyhow::Result;
 use batch_buffer::{BatchBuffer, SystemClock, DEFAULT_MAX_AGE_MS, DEFAULT_MAX_RECORDS};
 use event_schema::LogEvent;
 use manifest::Manifest;
-use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
+use rdkafka::consumer::{CommitMode, Consumer, ConsumerContext, Rebalance, StreamConsumer};
 use rdkafka::message::Message;
 use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
-use rdkafka::ClientConfig;
+use rdkafka::{ClientConfig, ClientContext};
 use tokio::sync::{broadcast, mpsc, Mutex, Semaphore};
 use tokio::time::interval;
 
@@ -54,13 +54,119 @@ impl Default for ConsumerConfig {
     }
 }
 
+/// Per-partition mutable state shared between the main consumer loop and the
+/// rebalance callback. Uses `std::sync::Mutex` (not tokio) so the callback —
+/// which runs on librdkafka's native C thread — can lock without a tokio context.
+struct PartitionStore {
+    buffers: HashMap<i32, BatchBuffer>,
+    pending: HashMap<i32, i64>,
+    committed: HashMap<i32, i64>,
+    paused: HashSet<i32>,
+}
+
+impl PartitionStore {
+    fn new() -> Self {
+        Self {
+            buffers: HashMap::new(),
+            pending: HashMap::new(),
+            committed: HashMap::new(),
+            paused: HashSet::new(),
+        }
+    }
+}
+
+/// rdkafka `ClientContext` that flushes buffered events to Parquet before any
+/// partition is revoked.
+///
+/// `pre_rebalance(Revoke)` runs on librdkafka's native C thread (not a tokio
+/// thread), so async flushes are driven inline via `rt_handle.block_on`. Flush
+/// results are forwarded on the same channel the main loop uses, keeping offset
+/// commits consistent with the normal flush path.
+struct RebalanceContext {
+    store: Arc<std::sync::Mutex<PartitionStore>>,
+    data_dir: PathBuf,
+    manifest: Arc<Mutex<Manifest>>,
+    flush_semaphore: Arc<Semaphore>,
+    flush_tx: mpsc::UnboundedSender<FlushResult>,
+    rt_handle: tokio::runtime::Handle,
+}
+
+impl ClientContext for RebalanceContext {}
+
+impl ConsumerContext for RebalanceContext {
+    fn pre_rebalance<'a>(&self, rebalance: &Rebalance<'a>) {
+        let Rebalance::Revoke(tpl) = rebalance else {
+            return;
+        };
+
+        let revoked: Vec<i32> = tpl.elements().iter().map(|e| e.partition()).collect();
+        if revoked.is_empty() {
+            return;
+        }
+
+        // Extract and remove all revoked partition state under the std Mutex.
+        // The lock is held only for the in-memory operation; never across the flush.
+        let to_flush: Vec<(i32, Vec<LogEvent>, i64)> = {
+            let mut store = self.store.lock().unwrap();
+            revoked
+                .iter()
+                .filter_map(|&p| {
+                    let batch = store
+                        .buffers
+                        .remove(&p)
+                        .map(|mut b| b.drain())
+                        .unwrap_or_default();
+                    let up_to_offset = store.pending.remove(&p).unwrap_or(0);
+                    store.committed.remove(&p);
+                    store.paused.remove(&p);
+                    (!batch.is_empty()).then_some((p, batch, up_to_offset))
+                })
+                .collect()
+        };
+
+        // Flush each revoked partition's batch synchronously on the tokio runtime.
+        // block_on is safe here because this callback runs on librdkafka's native
+        // C thread, not on a tokio worker thread.
+        for (partition, batch, up_to_offset) in to_flush {
+            let success = self.rt_handle.block_on(flush_gated(
+                &batch,
+                &self.data_dir,
+                &self.manifest,
+                &self.flush_semaphore,
+            ));
+            let _ = self.flush_tx.send(FlushResult { partition, up_to_offset, success });
+        }
+    }
+
+    fn post_rebalance<'a>(&self, rebalance: &Rebalance<'a>) {
+        match rebalance {
+            Rebalance::Assign(tpl) => {
+                let partitions: Vec<i32> = tpl.elements().iter().map(|e| e.partition()).collect();
+                tracing::info!("rebalance: assigned partitions {partitions:?}");
+                // BatchBuffers are initialized lazily on first message; nothing to do here.
+            }
+            Rebalance::Revoke(tpl) => {
+                let partitions: Vec<i32> = tpl.elements().iter().map(|e| e.partition()).collect();
+                tracing::info!("rebalance: revocation complete for partitions {partitions:?}");
+            }
+            Rebalance::Error(e) => {
+                tracing::error!("rebalance error: {e}");
+            }
+        }
+    }
+}
+
 /// Run the Kafka consumer loop until a shutdown signal is received.
 ///
-/// Each Kafka partition owns its own `BatchBuffer`. Flush tasks are spawned
-/// concurrently via `tokio::spawn`; a shared `flush_semaphore` caps how many
-/// Parquet writes execute at once across all partitions. Flush results are
-/// reported back on an `mpsc` channel so the main loop can commit offsets and
-/// resume paused partitions without exposing the `StreamConsumer` to worker tasks.
+/// Each Kafka partition owns its own `BatchBuffer` inside a shared
+/// `PartitionStore`. Flush tasks are spawned concurrently via `tokio::spawn`;
+/// a shared `flush_semaphore` caps how many Parquet writes execute at once.
+/// Flush results are reported back on an `mpsc` channel so the main loop can
+/// commit offsets and resume paused partitions.
+///
+/// A `RebalanceContext` drains and flushes buffered events for any partition
+/// about to be revoked, ensuring no buffered-but-unflushed events are lost
+/// during consumer group rebalancing.
 ///
 /// Offset commits are at-least-once: offsets are committed only after a
 /// confirmed successful Parquet write and manifest update.
@@ -72,29 +178,29 @@ pub async fn run_consumer(
     flush_semaphore: Arc<Semaphore>,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<()> {
-    let consumer: StreamConsumer = ClientConfig::new()
+    let (flush_tx, mut flush_rx) = mpsc::unbounded_channel::<FlushResult>();
+
+    let store = Arc::new(std::sync::Mutex::new(PartitionStore::new()));
+
+    let ctx = RebalanceContext {
+        store: Arc::clone(&store),
+        data_dir: data_dir.clone(),
+        manifest: Arc::clone(&manifest),
+        flush_semaphore: Arc::clone(&flush_semaphore),
+        flush_tx: flush_tx.clone(),
+        rt_handle: tokio::runtime::Handle::current(),
+    };
+
+    let consumer: StreamConsumer<RebalanceContext> = ClientConfig::new()
         .set("bootstrap.servers", &config.bootstrap_servers)
         .set("group.id", &config.group_id)
         .set("auto.offset.reset", "earliest")
         .set("enable.auto.commit", "false")
         .set("enable.auto.offset.store", "false")
-        .create()?;
+        .create_with_context(ctx)?;
 
     consumer.subscribe(&[&config.topic])?;
     tracing::info!("consumer subscribed to topic '{}'", config.topic);
-
-    let (flush_tx, mut flush_rx) = mpsc::unbounded_channel::<FlushResult>();
-
-    // Per-partition state — all keyed by partition id (i32).
-    let mut buffers: HashMap<i32, BatchBuffer> = HashMap::new();
-    // Highest next-to-read offset received per partition. Snapshot captured at
-    // flush-spawn time and committed to Kafka after a successful write.
-    let mut pending: HashMap<i32, i64> = HashMap::new();
-    // Last successfully committed offset per partition. Guards against backward
-    // commits when out-of-order flush tasks complete.
-    let mut committed: HashMap<i32, i64> = HashMap::new();
-    // Partitions currently paused for backpressure or semaphore saturation.
-    let mut paused: HashSet<i32> = HashSet::new();
 
     let mut tick = interval(Duration::from_millis(100));
 
@@ -112,20 +218,49 @@ pub async fn run_consumer(
                                 event.kafka_partition = partition;
                                 event.kafka_offset = m.offset();
 
-                                // Advance the high-water mark for this partition.
-                                pending.insert(partition, m.offset() + 1);
+                                let (batch, up_to_offset, pause_semaphore, pause_highwater) = {
+                                    let mut s = store.lock().unwrap();
+                                    s.pending.insert(partition, m.offset() + 1);
 
-                                let buffer = buffers.entry(partition).or_insert_with(|| {
-                                    BatchBuffer::new(
-                                        config.batch_max_bytes,
-                                        DEFAULT_MAX_RECORDS,
-                                        DEFAULT_MAX_AGE_MS,
-                                        Box::new(SystemClock),
-                                    )
-                                });
+                                    let batch = {
+                                        let buf = s.buffers.entry(partition).or_insert_with(|| {
+                                            BatchBuffer::new(
+                                                config.batch_max_bytes,
+                                                DEFAULT_MAX_RECORDS,
+                                                DEFAULT_MAX_AGE_MS,
+                                                Box::new(SystemClock),
+                                            )
+                                        });
+                                        buf.push(event)
+                                    };
 
-                                if let Some(batch) = buffer.push(event) {
-                                    let up_to_offset = pending[&partition];
+                                    let up_to_offset = s.pending[&partition];
+                                    let is_paused = s.paused.contains(&partition);
+
+                                    if batch.is_some() {
+                                        // Flush triggered — pause if semaphore saturated.
+                                        let sem = flush_semaphore.available_permits() == 0 && !is_paused;
+                                        if sem { s.paused.insert(partition); }
+                                        (batch, up_to_offset, sem, false)
+                                    } else {
+                                        // No flush — check high-water mark.
+                                        let occ = s.buffers[&partition].occupancy();
+                                        let hwm = !is_paused && occ > HIGH_WATER_MARK;
+                                        if hwm { s.paused.insert(partition); }
+                                        (None, up_to_offset, false, hwm)
+                                    }
+                                };
+
+                                if pause_semaphore || pause_highwater {
+                                    pause_partition(
+                                        &consumer,
+                                        &config.topic,
+                                        partition,
+                                        &backpressure_pauses,
+                                    );
+                                }
+
+                                if let Some(batch) = batch {
                                     spawn_flush(
                                         partition,
                                         batch,
@@ -133,22 +268,8 @@ pub async fn run_consumer(
                                         &data_dir,
                                         &manifest,
                                         &flush_semaphore,
-                                        &backpressure_pauses,
                                         &flush_tx,
-                                        &mut paused,
-                                        &consumer,
-                                        &config.topic,
                                     );
-                                } else if !paused.contains(&partition)
-                                    && buffers[&partition].occupancy() > HIGH_WATER_MARK
-                                {
-                                    pause_partition(
-                                        &consumer,
-                                        &config.topic,
-                                        partition,
-                                        &backpressure_pauses,
-                                    );
-                                    paused.insert(partition);
                                 }
                             }
                         }
@@ -158,35 +279,66 @@ pub async fn run_consumer(
 
             Some(result) = flush_rx.recv() => {
                 if result.success {
-                    // Monotonic guard: never commit a lower offset than already committed.
-                    let last = committed.get(&result.partition).copied().unwrap_or(0);
-                    if result.up_to_offset > last {
+                    let (do_commit, do_resume) = {
+                        let s = store.lock().unwrap();
+                        let last = s.committed.get(&result.partition).copied().unwrap_or(0);
+                        let occ = s
+                            .buffers
+                            .get(&result.partition)
+                            .map(|b| b.occupancy())
+                            .unwrap_or(0.0);
+                        (
+                            result.up_to_offset > last,
+                            s.paused.contains(&result.partition) && occ < LOW_WATER_MARK,
+                        )
+                    };
+                    if do_commit {
                         commit_offset(
                             &consumer,
                             &config.topic,
                             result.partition,
                             result.up_to_offset,
                         );
-                        committed.insert(result.partition, result.up_to_offset);
+                        store.lock().unwrap().committed.insert(result.partition, result.up_to_offset);
                     }
-                    // Resume the partition if it was paused and its buffer has drained.
-                    let occ = buffers
-                        .get(&result.partition)
-                        .map(|b| b.occupancy())
-                        .unwrap_or(0.0);
-                    if paused.contains(&result.partition) && occ < LOW_WATER_MARK {
+                    if do_resume {
                         resume_partition(&consumer, &config.topic, result.partition);
-                        paused.remove(&result.partition);
+                        store.lock().unwrap().paused.remove(&result.partition);
                     }
                 }
             }
 
             _ = tick.tick() => {
                 // Age-triggered flush: check every partition buffer independently.
-                let partitions: Vec<i32> = buffers.keys().copied().collect();
+                let partitions: Vec<i32> =
+                    store.lock().unwrap().buffers.keys().copied().collect();
                 for partition in partitions {
-                    if let Some(batch) = buffers.get_mut(&partition).and_then(|b| b.poll()) {
-                        let up_to_offset = pending.get(&partition).copied().unwrap_or(0);
+                    let batch_info = {
+                        let mut s = store.lock().unwrap();
+                        let batch = match s.buffers.get_mut(&partition) {
+                            Some(b) => b.poll(),
+                            None => None,
+                        };
+                        if let Some(batch) = batch {
+                            let up_to_offset = s.pending.get(&partition).copied().unwrap_or(0);
+                            let is_paused = s.paused.contains(&partition);
+                            let sem =
+                                flush_semaphore.available_permits() == 0 && !is_paused;
+                            if sem { s.paused.insert(partition); }
+                            Some((batch, up_to_offset, sem))
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some((batch, up_to_offset, pause_semaphore)) = batch_info {
+                        if pause_semaphore {
+                            pause_partition(
+                                &consumer,
+                                &config.topic,
+                                partition,
+                                &backpressure_pauses,
+                            );
+                        }
                         spawn_flush(
                             partition,
                             batch,
@@ -194,36 +346,49 @@ pub async fn run_consumer(
                             &data_dir,
                             &manifest,
                             &flush_semaphore,
-                            &backpressure_pauses,
                             &flush_tx,
-                            &mut paused,
-                            &consumer,
-                            &config.topic,
                         );
                     }
                 }
             }
 
             _ = shutdown.recv() => {
-                let total: usize = buffers.values().map(|b| b.len()).sum();
+                let (total, n_partitions, partition_batches) = {
+                    let mut s = store.lock().unwrap();
+                    let total: usize = s.buffers.values().map(|b| b.len()).sum();
+                    let n_partitions = s.buffers.len();
+                    let keys: Vec<i32> = s.buffers.keys().copied().collect();
+                    let mut batches: Vec<(i32, Vec<LogEvent>, i64)> = Vec::new();
+                    for p in keys {
+                        if s.buffers.get(&p).map_or(true, |b| b.is_empty()) {
+                            continue;
+                        }
+                        let batch = s.buffers.get_mut(&p).unwrap().drain();
+                        let up_to_offset = s.pending.get(&p).copied().unwrap_or(0);
+                        batches.push((p, batch, up_to_offset));
+                    }
+                    (total, n_partitions, batches)
+                };
+
                 tracing::info!(
                     "consumer shutting down — draining {total} buffered events \
-                     across {} partition(s)",
-                    buffers.len()
+                     across {n_partitions} partition(s)",
                 );
+
                 // Flush each partition's remaining buffer inline. In-flight spawned
                 // tasks continue to run and commit their own offsets after we return.
-                for (partition, buffer) in &mut buffers {
-                    if buffer.is_empty() {
-                        continue;
-                    }
-                    let batch = buffer.drain();
-                    let up_to_offset = pending.get(partition).copied().unwrap_or(0);
+                for (partition, batch, up_to_offset) in partition_batches {
                     if flush_gated(&batch, &data_dir, &manifest, &flush_semaphore).await {
-                        let last = committed.get(partition).copied().unwrap_or(0);
+                        let last = store
+                            .lock()
+                            .unwrap()
+                            .committed
+                            .get(&partition)
+                            .copied()
+                            .unwrap_or(0);
                         if up_to_offset > last {
-                            commit_offset(&consumer, &config.topic, *partition, up_to_offset);
-                            committed.insert(*partition, up_to_offset);
+                            commit_offset(&consumer, &config.topic, partition, up_to_offset);
+                            store.lock().unwrap().committed.insert(partition, up_to_offset);
                         }
                     }
                 }
@@ -235,10 +400,8 @@ pub async fn run_consumer(
     Ok(())
 }
 
-/// Spawn an async flush task for `partition`. Pauses the partition first if the
-/// flush semaphore is already saturated so no new messages accumulate while
-/// waiting for a slot. Results are sent back on `tx` for the main loop to
-/// handle offset commits and partition resumes.
+/// Spawn an async flush task. Pause/semaphore checks are handled by the caller
+/// before invoking this function.
 fn spawn_flush(
     partition: i32,
     batch: Vec<LogEvent>,
@@ -246,16 +409,8 @@ fn spawn_flush(
     data_dir: &PathBuf,
     manifest: &Arc<Mutex<Manifest>>,
     semaphore: &Arc<Semaphore>,
-    pauses_total: &AtomicU64,
     tx: &mpsc::UnboundedSender<FlushResult>,
-    paused: &mut HashSet<i32>,
-    consumer: &StreamConsumer,
-    topic: &str,
 ) {
-    if semaphore.available_permits() == 0 && !paused.contains(&partition) {
-        pause_partition(consumer, topic, partition, pauses_total);
-        paused.insert(partition);
-    }
     let data_dir = data_dir.clone();
     let manifest = Arc::clone(manifest);
     let semaphore = Arc::clone(semaphore);
@@ -299,7 +454,12 @@ async fn do_flush(batch: &[LogEvent], data_dir: &PathBuf, manifest: &Arc<Mutex<M
 
 /// Commit a single partition's offset to Kafka synchronously.
 /// Called only after a confirmed successful flush.
-fn commit_offset(consumer: &StreamConsumer, topic: &str, partition: i32, up_to_offset: i64) {
+fn commit_offset<C: ConsumerContext>(
+    consumer: &StreamConsumer<C>,
+    topic: &str,
+    partition: i32,
+    up_to_offset: i64,
+) {
     let mut tpl = TopicPartitionList::new();
     if let Err(e) = tpl.add_partition_offset(topic, partition, Offset::Offset(up_to_offset)) {
         tracing::error!("failed to build offset entry for partition {partition}: {e}");
@@ -314,8 +474,8 @@ fn commit_offset(consumer: &StreamConsumer, topic: &str, partition: i32, up_to_o
 
 /// Pause a specific Kafka partition. Called when its buffer occupancy exceeds
 /// HIGH_WATER_MARK or when the flush semaphore is exhausted.
-fn pause_partition(
-    consumer: &StreamConsumer,
+fn pause_partition<C: ConsumerContext>(
+    consumer: &StreamConsumer<C>,
     topic: &str,
     partition: i32,
     pauses_total: &AtomicU64,
@@ -334,7 +494,7 @@ fn pause_partition(
 
 /// Resume a specific Kafka partition. Called after its buffer drops below
 /// LOW_WATER_MARK following a successful flush.
-fn resume_partition(consumer: &StreamConsumer, topic: &str, partition: i32) {
+fn resume_partition<C: ConsumerContext>(consumer: &StreamConsumer<C>, topic: &str, partition: i32) {
     let mut tpl = TopicPartitionList::new();
     tpl.add_partition(topic, partition);
     if let Err(e) = consumer.resume(&tpl) {
