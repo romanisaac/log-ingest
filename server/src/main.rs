@@ -327,7 +327,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn datafusion_reads_parquet_from_minio() {
-        use event_schema::encode_batch;
+        use event_schema::{encode_batch, Level};
         use object_store::path::Path as ObjPath;
         use parquet::arrow::ArrowWriter;
         use storage::{minio_store, MinioConfig};
