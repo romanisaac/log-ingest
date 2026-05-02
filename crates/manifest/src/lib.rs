@@ -1,1 +1,143 @@
-// SQLite WAL metadata catalog — implemented in issue #2
+use anyhow::{Context, Result};
+use rusqlite::{params, Connection};
+use std::path::Path;
+
+/// Metadata for a single Parquet file registered in the manifest.
+#[derive(Debug, Clone)]
+pub struct FileEntry {
+    pub id: i64,
+    pub path: String,
+    pub tier: String,
+    pub service: String,
+    pub time_bucket: String,
+    pub min_ts: i64,
+    pub max_ts: i64,
+    pub size_bytes: i64,
+    pub record_count: i64,
+    pub state: String,
+    pub min_kafka_offset: i64,
+    pub max_kafka_offset: i64,
+}
+
+/// Parameters needed to register a new file.
+pub struct FlushMeta {
+    pub path: String,
+    pub service: String,
+    pub time_bucket: String,
+    pub min_ts: i64,
+    pub max_ts: i64,
+    pub size_bytes: i64,
+    pub record_count: i64,
+    pub min_kafka_offset: i64,
+    pub max_kafka_offset: i64,
+}
+
+/// SQLite-backed manifest catalog.
+pub struct Manifest {
+    conn: Connection,
+}
+
+impl Manifest {
+    /// Open (or create) the manifest database at the given path.
+    pub fn open(db_path: &Path) -> Result<Self> {
+        let conn = Connection::open(db_path).context("open manifest db")?;
+
+        // WAL mode for concurrent reads.
+        conn.execute_batch("PRAGMA journal_mode=WAL;")
+            .context("set WAL mode")?;
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS files (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                path              TEXT NOT NULL UNIQUE,
+                tier              TEXT NOT NULL DEFAULT 'hot',
+                service           TEXT NOT NULL,
+                time_bucket       TEXT NOT NULL,
+                min_ts            INTEGER NOT NULL,
+                max_ts            INTEGER NOT NULL,
+                size_bytes        INTEGER NOT NULL,
+                record_count      INTEGER NOT NULL,
+                state             TEXT NOT NULL DEFAULT 'active',
+                min_kafka_offset  INTEGER NOT NULL,
+                max_kafka_offset  INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_files_covering
+                ON files (service, time_bucket, min_ts, max_ts);",
+        )
+        .context("create schema")?;
+
+        Ok(Manifest { conn })
+    }
+
+    /// Register a newly flushed Parquet file.
+    pub fn commit_flush(&mut self, meta: &FlushMeta) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO files
+                (path, service, time_bucket, min_ts, max_ts,
+                 size_bytes, record_count, min_kafka_offset, max_kafka_offset)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                meta.path,
+                meta.service,
+                meta.time_bucket,
+                meta.min_ts,
+                meta.max_ts,
+                meta.size_bytes,
+                meta.record_count,
+                meta.min_kafka_offset,
+                meta.max_kafka_offset,
+            ],
+        )
+        .context("insert file entry")?;
+
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Return paths of all active files, optionally filtered by service.
+    pub fn active_files(&self, service: Option<&str>) -> Result<Vec<FileEntry>> {
+        let mut stmt = if let Some(svc) = service {
+            let mut s = self
+                .conn
+                .prepare(
+                    "SELECT id, path, tier, service, time_bucket, min_ts, max_ts,
+                            size_bytes, record_count, state, min_kafka_offset, max_kafka_offset
+                     FROM files WHERE state = 'active' AND service = ?1",
+                )
+                .context("prepare active_files query")?;
+            let rows = s
+                .query_map(params![svc], map_row)
+                .context("query active_files")?;
+            return rows.collect::<std::result::Result<_, _>>().context("collect rows");
+        } else {
+            self.conn
+                .prepare(
+                    "SELECT id, path, tier, service, time_bucket, min_ts, max_ts,
+                            size_bytes, record_count, state, min_kafka_offset, max_kafka_offset
+                     FROM files WHERE state = 'active'",
+                )
+                .context("prepare active_files query")?
+        };
+
+        let rows = stmt
+            .query_map([], map_row)
+            .context("query active_files")?;
+        rows.collect::<std::result::Result<_, _>>().context("collect rows")
+    }
+}
+
+fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileEntry> {
+    Ok(FileEntry {
+        id: row.get(0)?,
+        path: row.get(1)?,
+        tier: row.get(2)?,
+        service: row.get(3)?,
+        time_bucket: row.get(4)?,
+        min_ts: row.get(5)?,
+        max_ts: row.get(6)?,
+        size_bytes: row.get(7)?,
+        record_count: row.get(8)?,
+        state: row.get(9)?,
+        min_kafka_offset: row.get(10)?,
+        max_kafka_offset: row.get(11)?,
+    })
+}

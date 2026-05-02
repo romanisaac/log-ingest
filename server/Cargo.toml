@@ -12,3 +12,18 @@ axum = "0.7"
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+
+event-schema = { path = "../crates/event-schema" }
+manifest = { path = "../crates/manifest" }
+
+datafusion = "44"
+parquet = "53.4"
+arrow = { version = "53.4", features = ["ipc"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"
+
+[dev-dependencies]
+tempfile = "3"

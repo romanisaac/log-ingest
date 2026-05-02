@@ -1,4 +1,4 @@
-.PHONY: build test lint seed up down
+.PHONY: build test lint seed up down clean
 
 build:
 	cargo build
@@ -19,3 +19,6 @@ seed: ## Publish 1000 synthetic log events to Redpanda
 	@echo "Creating 'logs' topic..."
 	@docker compose exec redpanda rpk topic create logs --partitions 4 2>/dev/null || true
 	@cargo run --bin seed
+
+clean: ## Delete local Parquet data and manifest (resets server state for testing)
+	rm -rf data/ manifest.db
