@@ -480,4 +480,153 @@ mod tests {
         let rows = run_query(state, req).await.unwrap();
         assert_eq!(rows.len(), N, "expected {N} events, got {}", rows.len());
     }
+
+    /// After a successful flush, a second consumer with the same group ID must not
+    /// re-consume events — proves offsets were committed.
+    /// Requires: `make up`
+    #[tokio::test]
+    #[ignore]
+    async fn committed_offsets_not_reprocessed_after_flush() {
+        use rdkafka::config::ClientConfig;
+        use rdkafka::consumer::{Consumer, StreamConsumer};
+        use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
+        use std::time::Duration;
+
+        let topic = format!("test-committed-{}", uuid::Uuid::new_v4());
+        let group_id = format!("grp-{}", uuid::Uuid::new_v4());
+        const N: usize = 5;
+
+        let producer: BaseProducer = ClientConfig::new()
+            .set("bootstrap.servers", "localhost:9092")
+            .set("message.timeout.ms", "5000")
+            .create().unwrap();
+
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as i64;
+
+        for i in 0..N {
+            let event = serde_json::json!({
+                "timestamp": now_ns + i as i64, "level": "INFO",
+                "service": "commit-test", "message": "commit test",
+                "kafka_partition": 0, "kafka_offset": i, "attributes": {}
+            });
+            producer.send(BaseRecord::to(&topic).payload(&event.to_string()).key(&format!("{i}"))).unwrap();
+        }
+        producer.flush(Duration::from_secs(5)).unwrap();
+
+        // First consumer: flushes events and commits offsets.
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = Arc::new(Mutex::new(Manifest::open(&dir.path().join("manifest.db")).unwrap()));
+        let (tx, rx) = tokio::sync::broadcast::channel::<()>(1);
+        let m2 = Arc::clone(&manifest);
+        let data_dir = dir.path().join("data");
+        let dd = data_dir.clone();
+        let gid = group_id.clone();
+        let top = topic.clone();
+        tokio::spawn(async move {
+            let _ = run_consumer(ConsumerConfig {
+                bootstrap_servers: "localhost:9092".to_string(),
+                group_id: gid, topic: top,
+            }, dd, m2, rx).await;
+        });
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let _ = tx.send(());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Second consumer with the same group ID: should see no messages because
+        // offsets were committed to the end of the topic.
+        let second: StreamConsumer = ClientConfig::new()
+            .set("bootstrap.servers", "localhost:9092")
+            .set("group.id", &group_id)
+            .set("auto.offset.reset", "earliest")
+            .set("enable.auto.commit", "false")
+            .create().unwrap();
+        second.subscribe(&[topic.as_str()]).unwrap();
+
+        // Allow time for partition assignment, then assert no messages arrive.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let result = tokio::time::timeout(Duration::from_secs(2), second.recv()).await;
+        assert!(result.is_err(), "second consumer received a message — offsets were not committed");
+    }
+
+    /// A consumer that crashes without committing offsets must cause the next
+    /// consumer (same group) to re-consume and re-flush those events — proves
+    /// at-least-once delivery.
+    /// Requires: `make up`
+    #[tokio::test]
+    #[ignore]
+    async fn uncommitted_offsets_reprocessed_on_restart() {
+        use rdkafka::config::ClientConfig;
+        use rdkafka::consumer::{Consumer, StreamConsumer};
+        use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
+        use rdkafka::message::Message;
+        use std::time::Duration;
+
+        let topic = format!("test-reprocess-{}", uuid::Uuid::new_v4());
+        let group_id = format!("grp-{}", uuid::Uuid::new_v4());
+        const N: usize = 5;
+
+        let producer: BaseProducer = ClientConfig::new()
+            .set("bootstrap.servers", "localhost:9092")
+            .set("message.timeout.ms", "5000")
+            .create().unwrap();
+
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as i64;
+
+        for i in 0..N {
+            let event = serde_json::json!({
+                "timestamp": now_ns + i as i64, "level": "INFO",
+                "service": "reprocess-test", "message": "reprocess test",
+                "kafka_partition": 0, "kafka_offset": i, "attributes": {}
+            });
+            producer.send(BaseRecord::to(&topic).payload(&event.to_string()).key(&format!("{i}"))).unwrap();
+        }
+        producer.flush(Duration::from_secs(5)).unwrap();
+
+        // Simulate crash: consume all N events but do NOT commit offsets.
+        {
+            let crasher: StreamConsumer = ClientConfig::new()
+                .set("bootstrap.servers", "localhost:9092")
+                .set("group.id", &group_id)
+                .set("auto.offset.reset", "earliest")
+                .set("enable.auto.commit", "false")
+                .set("enable.auto.offset.store", "false")
+                .create().unwrap();
+            crasher.subscribe(&[topic.as_str()]).unwrap();
+            for _ in 0..N {
+                tokio::time::timeout(Duration::from_secs(5), crasher.recv())
+                    .await.expect("timed out waiting for message").unwrap();
+            }
+            // crasher dropped here without committing — simulates kill -9
+        }
+
+        // Recovery: run_consumer with the same group ID. Because no offsets were
+        // committed, it re-consumes all N events from the beginning.
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = Arc::new(Mutex::new(Manifest::open(&dir.path().join("manifest.db")).unwrap()));
+        let (tx, rx) = tokio::sync::broadcast::channel::<()>(1);
+        let m2 = Arc::clone(&manifest);
+        let data_dir = dir.path().join("data");
+        let dd = data_dir.clone();
+        let gid = group_id.clone();
+        let top = topic.clone();
+        tokio::spawn(async move {
+            let _ = run_consumer(ConsumerConfig {
+                bootstrap_servers: "localhost:9092".to_string(),
+                group_id: gid, topic: top,
+            }, dd, m2, rx).await;
+        });
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let _ = tx.send(());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // All N events must be present — none were permanently lost.
+        let state = AppState { manifest };
+        let rows = run_query(state, QueryRequest {
+            sql: "SELECT * FROM logs".to_string(),
+            time_from: Some(0), time_to: Some(i64::MAX), limit: 1000,
+        }).await.unwrap();
+        assert_eq!(rows.len(), N, "expected {N} events after re-consumption, got {}", rows.len());
+    }
 }

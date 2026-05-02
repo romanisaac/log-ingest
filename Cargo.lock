@@ -2938,6 +2938,7 @@ dependencies = [
  "manifest",
  "object_store",
  "parquet",
+ "rdkafka",
  "serde",
  "serde_json",
  "storage",
