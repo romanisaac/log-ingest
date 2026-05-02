@@ -152,7 +152,7 @@ curl -s -X POST localhost:8080/query \
 }
 ```
 
-- `time_from` / `time_to` — nanosecond epoch timestamps (optional; defaults to all time)
+- `time_from` / `time_to` — nanosecond epoch timestamps (**required**; omitting either returns HTTP 400)
 - `limit` — max rows returned (default 1000)
 - Response: JSON array of row objects
 
