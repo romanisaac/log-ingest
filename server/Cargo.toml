@@ -28,3 +28,4 @@ chrono = "0.4"
 [dev-dependencies]
 tempfile = "3"
 batch-buffer = { path = "../crates/batch-buffer" }
+tower = { version = "0.5", features = ["util"] }
