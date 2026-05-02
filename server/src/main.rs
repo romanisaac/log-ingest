@@ -17,17 +17,12 @@ use tokio::sync::Mutex;
 #[derive(Debug, Deserialize)]
 struct QueryRequest {
     sql: String,
-    #[serde(default)]
-    #[allow(dead_code)] // time predicate enforcement added in issue #4
-    time_from: i64,
-    #[serde(default = "default_time_to")]
-    #[allow(dead_code)]
-    time_to: i64,
+    time_from: Option<i64>,
+    time_to: Option<i64>,
     #[serde(default = "default_limit")]
     limit: usize,
 }
 
-fn default_time_to() -> i64 { i64::MAX }
 fn default_limit() -> usize { 1000 }
 
 #[derive(Clone)]
@@ -39,6 +34,16 @@ async fn query_handler(
     State(state): State<AppState>,
     Json(req): Json<QueryRequest>,
 ) -> impl IntoResponse {
+    if req.time_from.is_none() || req.time_to.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "time_from and time_to are required",
+                "code": "missing_time_predicate"
+            })),
+        ).into_response();
+    }
+
     match run_query(state, req).await {
         Ok(rows) => (StatusCode::OK, Json(rows)).into_response(),
         Err(e) => (
@@ -159,6 +164,7 @@ mod tests {
     use super::*;
     use event_schema::{AttributeValue, Level};
     use std::collections::HashMap;
+    use tower::util::ServiceExt;
 
     fn make_event() -> LogEvent {
         let mut attrs = HashMap::new();
@@ -195,8 +201,8 @@ mod tests {
         let state = AppState { manifest: Arc::new(Mutex::new(manifest)) };
         let req = QueryRequest {
             sql: "SELECT * FROM logs".to_string(),
-            time_from: 0,
-            time_to: i64::MAX,
+            time_from: Some(0),
+            time_to: Some(i64::MAX),
             limit: 100,
         };
         let rows = run_query(state, req).await.unwrap();
@@ -243,5 +249,76 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, parquet_path.to_string_lossy());
         assert_eq!(files[0].record_count, 1);
+    }
+
+    #[tokio::test]
+    async fn missing_time_bounds_returns_400() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = Manifest::open(&dir.path().join("manifest.db")).unwrap();
+        let state = AppState { manifest: Arc::new(Mutex::new(manifest)) };
+
+        let app = Router::new()
+            .route("/query", post(query_handler))
+            .with_state(state);
+
+        let cases = [
+            serde_json::json!({"sql": "SELECT 1"}),
+            serde_json::json!({"sql": "SELECT 1", "time_from": 0}),
+            serde_json::json!({"sql": "SELECT 1", "time_to": 9999}),
+        ];
+
+        for body in &cases {
+            let response = axum::body::to_bytes(
+                app.clone()
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .method("POST")
+                            .uri("/query")
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .into_body(),
+                usize::MAX,
+            )
+            .await
+            .unwrap();
+
+            let json: serde_json::Value = serde_json::from_slice(&response).unwrap();
+            assert_eq!(json["code"], "missing_time_predicate", "body={body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn valid_time_bounds_returns_200() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = Manifest::open(&dir.path().join("manifest.db")).unwrap();
+        let state = AppState { manifest: Arc::new(Mutex::new(manifest)) };
+
+        let app = Router::new()
+            .route("/query", post(query_handler))
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "sql": "SELECT * FROM logs",
+            "time_from": 0,
+            "time_to": i64::MAX
+        });
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/query")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
