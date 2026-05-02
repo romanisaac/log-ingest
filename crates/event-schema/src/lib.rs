@@ -62,6 +62,26 @@ pub struct LogEvent {
     pub attributes: HashMap<String, AttributeValue>,
 }
 
+impl LogEvent {
+    /// Estimate the in-memory byte size of this event. Used by BatchBuffer to
+    /// track how full the buffer is without serializing each event.
+    pub fn estimated_byte_size(&self) -> usize {
+        8 // timestamp
+        + self.level.as_str().len()
+        + self.service.len()
+        + self.message.len()
+        + 4 // kafka_partition
+        + 8 // kafka_offset
+        + self.attributes.iter().map(|(k, v)| {
+            k.len() + match v {
+                AttributeValue::String(s) => s.len(),
+                AttributeValue::Int(_) | AttributeValue::Float(_) => 8,
+                AttributeValue::Bool(_) => 1,
+            }
+        }).sum::<usize>()
+    }
+}
+
 /// Arrow schema for log events.
 pub fn log_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![

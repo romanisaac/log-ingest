@@ -216,4 +216,32 @@ mod tests {
         assert_eq!(attrs["status_code"], AttributeValue::Int(200));
         assert_eq!(attrs["cached"], AttributeValue::Bool(true));
     }
+
+    #[test]
+    fn buffer_flush_writes_parquet_and_registers_in_manifest() {
+        use batch_buffer::BatchBuffer;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("manifest.db");
+        let data_dir = dir.path().join("data");
+        let mut manifest = Manifest::open(&db_path).unwrap();
+
+        // Use a threshold small enough that a single make_event() push triggers a flush.
+        // make_event() estimated size is well over 100 bytes.
+        let mut buf = BatchBuffer::new(100);
+        let batch = buf.push(make_event()).expect("event should trigger flush");
+        assert_eq!(batch.len(), 1);
+        assert!(buf.is_empty());
+
+        let parquet_path = flush_events(&batch, &data_dir, &mut manifest).unwrap();
+
+        // Parquet file exists on disk.
+        assert!(parquet_path.exists(), "parquet file should exist at {parquet_path:?}");
+
+        // Manifest has exactly one entry pointing to that file.
+        let files = manifest.active_files(None).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, parquet_path.to_string_lossy());
+        assert_eq!(files[0].record_count, 1);
+    }
 }
