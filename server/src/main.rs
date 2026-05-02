@@ -648,9 +648,10 @@ mod tests {
         use rdkafka::config::ClientConfig as RdkConfig;
         use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
 
-        // ~240 bytes/event estimated; 500-byte limit means 2 events reach 96% occupancy
-        // (> 0.8 high-water mark) without triggering a size flush, so pause fires.
-        const BATCH_MAX_BYTES: usize = 500;
+        // 450 bytes/event estimated (31 fixed + 419 message); 1000-byte limit means
+        // 2 events reach 90% occupancy (> 0.8 high-water mark) without triggering a
+        // size flush (900 < 1000), so the pause check fires in the else branch.
+        const BATCH_MAX_BYTES: usize = 1000;
         const N: usize = 6;
 
         let topic = format!("test-bp-{}", uuid::Uuid::new_v4());
@@ -672,8 +673,8 @@ mod tests {
                 "timestamp": now_ns + i as i64,
                 "level": "INFO",
                 "service": "bp-test",
-                // ~220-char message → estimated ~240 bytes per event
-                "message": "x".repeat(220),
+                // 31 fixed bytes + 419 message = 450 bytes estimated per event
+                "message": "x".repeat(419),
                 "kafka_partition": 0,
                 "kafka_offset": i,
                 "attributes": {}
