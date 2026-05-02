@@ -126,12 +126,11 @@ mod tests {
     }
 
     #[test]
-    fn with_attributes() {
-        let mut buf = BatchBuffer::new(DEFAULT_MAX_BYTES);
-        let mut attrs = HashMap::new();
-        attrs.insert("key".to_string(), AttributeValue::String("value".to_string()));
-        attrs.insert("count".to_string(), AttributeValue::Int(42));
-        let event = LogEvent {
+    fn attributes_contribute_to_byte_count() {
+        // Bare event (no attrs): 8+5+1+1+4+8 = 27 bytes.
+        // With {"key":"value", "count":42}: +8 (3+5) + 13 (5+8) = 48 bytes.
+        // Threshold of 40 sits between them — bare fits, attributed flushes.
+        let make = |attrs: HashMap<String, AttributeValue>| LogEvent {
             timestamp: 0,
             level: Level::Debug,
             service: "x".to_string(),
@@ -140,8 +139,14 @@ mod tests {
             kafka_offset: 2,
             attributes: attrs,
         };
-        let result = buf.push(event);
-        assert!(result.is_none()); // well under 64MB
-        assert_eq!(buf.len(), 1);
+
+        let mut bare_buf = BatchBuffer::new(40);
+        assert!(bare_buf.push(make(HashMap::new())).is_none(), "bare event should not flush");
+
+        let mut attrs = HashMap::new();
+        attrs.insert("key".to_string(), AttributeValue::String("value".to_string()));
+        attrs.insert("count".to_string(), AttributeValue::Int(42));
+        let mut attr_buf = BatchBuffer::new(40);
+        assert!(attr_buf.push(make(attrs)).is_some(), "attributed event should flush");
     }
 }
