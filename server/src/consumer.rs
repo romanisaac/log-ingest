@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -12,13 +12,24 @@ use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::message::Message;
 use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
 use rdkafka::ClientConfig;
-use tokio::sync::{broadcast, Mutex, Semaphore};
+use tokio::sync::{broadcast, mpsc, Mutex, Semaphore};
 use tokio::time::interval;
 
 use crate::flush_events;
 
 const HIGH_WATER_MARK: f32 = 0.8;
 const LOW_WATER_MARK: f32 = 0.4;
+
+/// Result sent from a spawned flush task back to the main consumer loop.
+struct FlushResult {
+    partition: i32,
+    /// The next-to-read offset at the time the batch was drained. Committed to
+    /// Kafka only if strictly greater than the last committed offset for this
+    /// partition, guarding against backward commits when concurrent tasks finish
+    /// out of order.
+    up_to_offset: i64,
+    success: bool,
+}
 
 pub struct ConsumerConfig {
     pub bootstrap_servers: String,
@@ -45,19 +56,14 @@ impl Default for ConsumerConfig {
 
 /// Run the Kafka consumer loop until a shutdown signal is received.
 ///
-/// Offsets are committed manually, strictly after a successful Parquet flush
-/// and manifest commit (at-least-once delivery). If the process crashes before
-/// a flush completes, uncommitted events are re-consumed from Kafka on restart.
-/// Duplicates in the re-consumed window are removed at query time via
-/// (kafka_partition, kafka_offset) deduplication (issue #14).
+/// Each Kafka partition owns its own `BatchBuffer`. Flush tasks are spawned
+/// concurrently via `tokio::spawn`; a shared `flush_semaphore` caps how many
+/// Parquet writes execute at once across all partitions. Flush results are
+/// reported back on an `mpsc` channel so the main loop can commit offsets and
+/// resume paused partitions without exposing the `StreamConsumer` to worker tasks.
 ///
-/// `backpressure_pauses` is incremented each time the consumer pauses its
-/// Kafka partitions — either because buffer occupancy exceeded the high-water
-/// mark or because `flush_semaphore` was exhausted.
-///
-/// `flush_semaphore` caps how many Parquet flush operations may run concurrently
-/// across all partition workers. When all slots are occupied, the consumer pauses
-/// its partitions until a slot is available.
+/// Offset commits are at-least-once: offsets are committed only after a
+/// confirmed successful Parquet write and manifest update.
 pub async fn run_consumer(
     config: ConsumerConfig,
     data_dir: PathBuf,
@@ -77,17 +83,20 @@ pub async fn run_consumer(
     consumer.subscribe(&[&config.topic])?;
     tracing::info!("consumer subscribed to topic '{}'", config.topic);
 
-    let mut buffer = BatchBuffer::new(
-        config.batch_max_bytes,
-        DEFAULT_MAX_RECORDS,
-        DEFAULT_MAX_AGE_MS,
-        Box::new(SystemClock),
-    );
-    // Tracks the next-to-read offset (last consumed + 1) per (topic, partition).
-    // Reset after each successful commit so stale offsets are never re-committed.
-    let mut pending: HashMap<(String, i32), i64> = HashMap::new();
+    let (flush_tx, mut flush_rx) = mpsc::unbounded_channel::<FlushResult>();
+
+    // Per-partition state — all keyed by partition id (i32).
+    let mut buffers: HashMap<i32, BatchBuffer> = HashMap::new();
+    // Highest next-to-read offset received per partition. Snapshot captured at
+    // flush-spawn time and committed to Kafka after a successful write.
+    let mut pending: HashMap<i32, i64> = HashMap::new();
+    // Last successfully committed offset per partition. Guards against backward
+    // commits when out-of-order flush tasks complete.
+    let mut committed: HashMap<i32, i64> = HashMap::new();
+    // Partitions currently paused for backpressure or semaphore saturation.
+    let mut paused: HashSet<i32> = HashSet::new();
+
     let mut tick = interval(Duration::from_millis(100));
-    let mut is_paused = false;
 
     loop {
         tokio::select! {
@@ -99,65 +108,123 @@ pub async fn run_consumer(
                         match serde_json::from_slice::<LogEvent>(payload) {
                             Err(e) => tracing::warn!("failed to deserialize message: {e}"),
                             Ok(mut event) => {
-                                event.kafka_partition = m.partition();
+                                let partition = m.partition();
+                                event.kafka_partition = partition;
                                 event.kafka_offset = m.offset();
 
-                                // Record next-to-read offset for this partition.
-                                pending.insert(
-                                    (m.topic().to_string(), m.partition()),
-                                    m.offset() + 1,
-                                );
+                                // Advance the high-water mark for this partition.
+                                pending.insert(partition, m.offset() + 1);
+
+                                let buffer = buffers.entry(partition).or_insert_with(|| {
+                                    BatchBuffer::new(
+                                        config.batch_max_bytes,
+                                        DEFAULT_MAX_RECORDS,
+                                        DEFAULT_MAX_AGE_MS,
+                                        Box::new(SystemClock),
+                                    )
+                                });
 
                                 if let Some(batch) = buffer.push(event) {
-                                    maybe_pause_for_semaphore(
-                                        &consumer,
+                                    let up_to_offset = pending[&partition];
+                                    spawn_flush(
+                                        partition,
+                                        batch,
+                                        up_to_offset,
+                                        &data_dir,
+                                        &manifest,
                                         &flush_semaphore,
                                         &backpressure_pauses,
-                                        &mut is_paused,
+                                        &flush_tx,
+                                        &mut paused,
+                                        &consumer,
+                                        &config.topic,
                                     );
-                                    if flush_gated(&batch, &data_dir, &manifest, &flush_semaphore).await {
-                                        commit_offsets(&consumer, &pending);
-                                        pending.clear();
-                                        if is_paused && buffer.occupancy() < LOW_WATER_MARK {
-                                            resume_partitions(&consumer);
-                                            is_paused = false;
-                                        }
-                                    }
-                                } else if !is_paused && buffer.occupancy() > HIGH_WATER_MARK {
-                                    pause_partitions(&consumer, &backpressure_pauses);
-                                    is_paused = true;
+                                } else if !paused.contains(&partition)
+                                    && buffers[&partition].occupancy() > HIGH_WATER_MARK
+                                {
+                                    pause_partition(
+                                        &consumer,
+                                        &config.topic,
+                                        partition,
+                                        &backpressure_pauses,
+                                    );
+                                    paused.insert(partition);
                                 }
                             }
                         }
                     }
                 }
             }
-            _ = tick.tick() => {
-                if let Some(batch) = buffer.poll() {
-                    maybe_pause_for_semaphore(
-                        &consumer,
-                        &flush_semaphore,
-                        &backpressure_pauses,
-                        &mut is_paused,
-                    );
-                    if flush_gated(&batch, &data_dir, &manifest, &flush_semaphore).await {
-                        commit_offsets(&consumer, &pending);
-                        pending.clear();
-                        if is_paused && buffer.occupancy() < LOW_WATER_MARK {
-                            resume_partitions(&consumer);
-                            is_paused = false;
-                        }
+
+            Some(result) = flush_rx.recv() => {
+                if result.success {
+                    // Monotonic guard: never commit a lower offset than already committed.
+                    let last = committed.get(&result.partition).copied().unwrap_or(0);
+                    if result.up_to_offset > last {
+                        commit_offset(
+                            &consumer,
+                            &config.topic,
+                            result.partition,
+                            result.up_to_offset,
+                        );
+                        committed.insert(result.partition, result.up_to_offset);
+                    }
+                    // Resume the partition if it was paused and its buffer has drained.
+                    let occ = buffers
+                        .get(&result.partition)
+                        .map(|b| b.occupancy())
+                        .unwrap_or(0.0);
+                    if paused.contains(&result.partition) && occ < LOW_WATER_MARK {
+                        resume_partition(&consumer, &config.topic, result.partition);
+                        paused.remove(&result.partition);
                     }
                 }
             }
+
+            _ = tick.tick() => {
+                // Age-triggered flush: check every partition buffer independently.
+                let partitions: Vec<i32> = buffers.keys().copied().collect();
+                for partition in partitions {
+                    if let Some(batch) = buffers.get_mut(&partition).and_then(|b| b.poll()) {
+                        let up_to_offset = pending.get(&partition).copied().unwrap_or(0);
+                        spawn_flush(
+                            partition,
+                            batch,
+                            up_to_offset,
+                            &data_dir,
+                            &manifest,
+                            &flush_semaphore,
+                            &backpressure_pauses,
+                            &flush_tx,
+                            &mut paused,
+                            &consumer,
+                            &config.topic,
+                        );
+                    }
+                }
+            }
+
             _ = shutdown.recv() => {
+                let total: usize = buffers.values().map(|b| b.len()).sum();
                 tracing::info!(
-                    "consumer shutting down — draining {} buffered events",
-                    buffer.len()
+                    "consumer shutting down — draining {total} buffered events \
+                     across {} partition(s)",
+                    buffers.len()
                 );
-                if !buffer.is_empty() {
-                    if flush_gated(&buffer.drain(), &data_dir, &manifest, &flush_semaphore).await {
-                        commit_offsets(&consumer, &pending);
+                // Flush each partition's remaining buffer inline. In-flight spawned
+                // tasks continue to run and commit their own offsets after we return.
+                for (partition, buffer) in &mut buffers {
+                    if buffer.is_empty() {
+                        continue;
+                    }
+                    let batch = buffer.drain();
+                    let up_to_offset = pending.get(partition).copied().unwrap_or(0);
+                    if flush_gated(&batch, &data_dir, &manifest, &flush_semaphore).await {
+                        let last = committed.get(partition).copied().unwrap_or(0);
+                        if up_to_offset > last {
+                            commit_offset(&consumer, &config.topic, *partition, up_to_offset);
+                            committed.insert(*partition, up_to_offset);
+                        }
                     }
                 }
                 break;
@@ -166,6 +233,37 @@ pub async fn run_consumer(
     }
 
     Ok(())
+}
+
+/// Spawn an async flush task for `partition`. Pauses the partition first if the
+/// flush semaphore is already saturated so no new messages accumulate while
+/// waiting for a slot. Results are sent back on `tx` for the main loop to
+/// handle offset commits and partition resumes.
+fn spawn_flush(
+    partition: i32,
+    batch: Vec<LogEvent>,
+    up_to_offset: i64,
+    data_dir: &PathBuf,
+    manifest: &Arc<Mutex<Manifest>>,
+    semaphore: &Arc<Semaphore>,
+    pauses_total: &AtomicU64,
+    tx: &mpsc::UnboundedSender<FlushResult>,
+    paused: &mut HashSet<i32>,
+    consumer: &StreamConsumer,
+    topic: &str,
+) {
+    if semaphore.available_permits() == 0 && !paused.contains(&partition) {
+        pause_partition(consumer, topic, partition, pauses_total);
+        paused.insert(partition);
+    }
+    let data_dir = data_dir.clone();
+    let manifest = Arc::clone(manifest);
+    let semaphore = Arc::clone(semaphore);
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let success = flush_gated(&batch, &data_dir, &manifest, &semaphore).await;
+        let _ = tx.send(FlushResult { partition, up_to_offset, success });
+    });
 }
 
 /// Acquire a semaphore slot before flushing. Records the full duration
@@ -184,21 +282,6 @@ pub(crate) async fn flush_gated(
     ok
 }
 
-/// Pause Kafka partitions if the flush semaphore is currently exhausted.
-/// Called immediately before a flush so the consumer stops receiving new events
-/// while waiting for a semaphore slot.
-fn maybe_pause_for_semaphore(
-    consumer: &StreamConsumer,
-    semaphore: &Arc<Semaphore>,
-    pauses_total: &AtomicU64,
-    is_paused: &mut bool,
-) {
-    if !*is_paused && semaphore.available_permits() == 0 {
-        pause_partitions(consumer, pauses_total);
-        *is_paused = true;
-    }
-}
-
 /// Flush a batch to Parquet + manifest. Returns true on success.
 async fn do_flush(batch: &[LogEvent], data_dir: &PathBuf, manifest: &Arc<Mutex<Manifest>>) -> bool {
     let mut guard = manifest.lock().await;
@@ -214,59 +297,50 @@ async fn do_flush(batch: &[LogEvent], data_dir: &PathBuf, manifest: &Arc<Mutex<M
     }
 }
 
-/// Commit the pending offsets to Kafka synchronously.
+/// Commit a single partition's offset to Kafka synchronously.
 /// Called only after a confirmed successful flush.
-fn commit_offsets(consumer: &StreamConsumer, pending: &HashMap<(String, i32), i64>) {
-    if pending.is_empty() {
+fn commit_offset(consumer: &StreamConsumer, topic: &str, partition: i32, up_to_offset: i64) {
+    let mut tpl = TopicPartitionList::new();
+    if let Err(e) = tpl.add_partition_offset(topic, partition, Offset::Offset(up_to_offset)) {
+        tracing::error!("failed to build offset entry for partition {partition}: {e}");
         return;
     }
-    let mut tpl = TopicPartitionList::new();
-    for ((topic, partition), offset) in pending {
-        if let Err(e) = tpl.add_partition_offset(topic, *partition, Offset::Offset(*offset)) {
-            tracing::error!("failed to build offset list: {e}");
-            return;
-        }
-    }
     if let Err(e) = consumer.commit(&tpl, CommitMode::Sync) {
-        tracing::error!("offset commit failed: {e}");
+        tracing::error!("offset commit failed for partition {partition}: {e}");
     } else {
-        tracing::debug!("committed offsets for {} partition(s)", pending.len());
+        tracing::debug!("committed offset {up_to_offset} for partition {partition}");
     }
 }
 
-/// Pause all currently assigned partitions. Called when buffer occupancy exceeds
-/// HIGH_WATER_MARK or the flush semaphore is exhausted.
-fn pause_partitions(consumer: &StreamConsumer, pauses_total: &AtomicU64) {
-    match consumer.assignment() {
-        Ok(tpl) if !tpl.elements().is_empty() => {
-            if let Err(e) = consumer.pause(&tpl) {
-                tracing::error!("failed to pause partitions: {e}");
-            } else {
-                let count = pauses_total.fetch_add(1, Ordering::Relaxed) + 1;
-                tracing::info!(
-                    "backpressure: paused {} partition(s) (total pauses: {count})",
-                    tpl.count()
-                );
-            }
-        }
-        Ok(_) => {}
-        Err(e) => tracing::error!("failed to get assignment for pause: {e}"),
+/// Pause a specific Kafka partition. Called when its buffer occupancy exceeds
+/// HIGH_WATER_MARK or when the flush semaphore is exhausted.
+fn pause_partition(
+    consumer: &StreamConsumer,
+    topic: &str,
+    partition: i32,
+    pauses_total: &AtomicU64,
+) {
+    let mut tpl = TopicPartitionList::new();
+    tpl.add_partition(topic, partition);
+    if let Err(e) = consumer.pause(&tpl) {
+        tracing::error!("failed to pause partition {partition}: {e}");
+    } else {
+        let count = pauses_total.fetch_add(1, Ordering::Relaxed) + 1;
+        tracing::info!(
+            "backpressure: paused partition {partition} (total pauses: {count})"
+        );
     }
 }
 
-/// Resume all currently assigned partitions. Called after a flush drops occupancy
-/// below LOW_WATER_MARK (whether paused for backpressure or semaphore saturation).
-fn resume_partitions(consumer: &StreamConsumer) {
-    match consumer.assignment() {
-        Ok(tpl) if !tpl.elements().is_empty() => {
-            if let Err(e) = consumer.resume(&tpl) {
-                tracing::error!("failed to resume partitions: {e}");
-            } else {
-                tracing::info!("backpressure: resumed {} partition(s)", tpl.count());
-            }
-        }
-        Ok(_) => {}
-        Err(e) => tracing::error!("failed to get assignment for resume: {e}"),
+/// Resume a specific Kafka partition. Called after its buffer drops below
+/// LOW_WATER_MARK following a successful flush.
+fn resume_partition(consumer: &StreamConsumer, topic: &str, partition: i32) {
+    let mut tpl = TopicPartitionList::new();
+    tpl.add_partition(topic, partition);
+    if let Err(e) = consumer.resume(&tpl) {
+        tracing::error!("failed to resume partition {partition}: {e}");
+    } else {
+        tracing::info!("backpressure: resumed partition {partition}");
     }
 }
 
@@ -294,7 +368,6 @@ mod tests {
                     let _permit = sem.acquire().await.unwrap();
                     let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                     max_in_flight.fetch_max(current, Ordering::SeqCst);
-                    // Simulate flush work
                     tokio::time::sleep(Duration::from_millis(5)).await;
                     in_flight.fetch_sub(1, Ordering::SeqCst);
                 })
