@@ -234,7 +234,7 @@ mod tests {
 
         // Use a threshold small enough that a single make_event() push triggers a flush.
         // make_event() estimated size is well over 100 bytes.
-        let mut buf = BatchBuffer::new(100);
+        let mut buf = BatchBuffer::new(100, batch_buffer::DEFAULT_MAX_RECORDS);
         let batch = buf.push(make_event()).expect("event should trigger flush");
         assert_eq!(batch.len(), 1);
         assert!(buf.is_empty());
@@ -327,7 +327,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn datafusion_reads_parquet_from_minio() {
-        use event_schema::{encode_batch, Level};
+        use event_schema::encode_batch;
         use object_store::path::Path as ObjPath;
         use parquet::arrow::ArrowWriter;
         use storage::{minio_store, MinioConfig};

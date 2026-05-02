@@ -1,27 +1,34 @@
 use event_schema::LogEvent;
 
 pub const DEFAULT_MAX_BYTES: usize = 64 * 1024 * 1024;
+pub const DEFAULT_MAX_RECORDS: usize = 50_000;
 
 pub struct BatchBuffer {
     events: Vec<LogEvent>,
     current_bytes: usize,
     max_bytes: usize,
+    max_records: usize,
 }
 
 impl BatchBuffer {
-    pub fn new(max_bytes: usize) -> Self {
+    pub fn new(max_bytes: usize, max_records: usize) -> Self {
         Self {
             events: Vec::new(),
             current_bytes: 0,
             max_bytes,
+            max_records,
         }
     }
 
-    /// Push an event. Returns the flushed batch if the size threshold is reached.
+    pub fn with_defaults() -> Self {
+        Self::new(DEFAULT_MAX_BYTES, DEFAULT_MAX_RECORDS)
+    }
+
+    /// Push an event. Returns the flushed batch if either threshold is reached.
     pub fn push(&mut self, event: LogEvent) -> Option<Vec<LogEvent>> {
         self.current_bytes += event.estimated_byte_size();
         self.events.push(event);
-        if self.current_bytes >= self.max_bytes {
+        if self.current_bytes >= self.max_bytes || self.events.len() >= self.max_records {
             Some(self.drain())
         } else {
             None
@@ -68,34 +75,53 @@ mod tests {
 
     #[test]
     fn size_trigger_fires_exactly_once() {
-        // Each event's estimated size: 8 (ts) + 4 (level) + 3 (svc) + message_size + 4 (part) + 8 (offset) = 27 + message_size
-        // Use max_bytes = 100; push events until we cross it, then verify flush happened.
-        let mut buf = BatchBuffer::new(100);
+        let mut buf = BatchBuffer::new(100, DEFAULT_MAX_RECORDS);
 
-        // Push events of size 27 + 40 = 67 bytes each.
-        // First push: 67 bytes — no flush.
         let result = buf.push(make_event(40));
         assert!(result.is_none());
         assert_eq!(buf.len(), 1);
 
-        // Second push: 134 bytes total — crosses 100, flush triggered.
         let result = buf.push(make_event(40));
         let batch = result.expect("expected flush on second push");
         assert_eq!(batch.len(), 2);
 
-        // Buffer should be empty after flush.
         assert!(buf.is_empty());
         assert_eq!(buf.len(), 0);
     }
 
     #[test]
+    fn record_count_trigger_fires_before_size_limit() {
+        // Small events — 27 bytes each — so 5 events = 135 bytes, well under a 10 KB size limit.
+        // Set max_records = 5 to trigger on count first.
+        let mut buf = BatchBuffer::new(10_000, 5);
+
+        for _ in 0..4 {
+            assert!(buf.push(make_event(0)).is_none(), "should not flush before limit");
+        }
+
+        let batch = buf.push(make_event(0)).expect("5th event should trigger flush");
+        assert_eq!(batch.len(), 5);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn size_trigger_fires_before_record_count_limit() {
+        // Large events — each one is 27 + 1000 = 1027 bytes.
+        // max_bytes = 1500 → flush after 2 events (2054 bytes).
+        // max_records = 1000 → would never fire before size.
+        let mut buf = BatchBuffer::new(1_500, 1_000);
+
+        assert!(buf.push(make_event(1000)).is_none());
+        let batch = buf.push(make_event(1000)).expect("size trigger should fire on 2nd event");
+        assert_eq!(batch.len(), 2);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
     fn occupancy_tracks_fill_level() {
-        let mut buf = BatchBuffer::new(100);
+        let mut buf = BatchBuffer::new(100, DEFAULT_MAX_RECORDS);
         assert_eq!(buf.occupancy(), 0.0);
 
-        // One event of size 50 bytes → occupancy = 0.5
-        // 8 + 4 + 3 + 27 + 4 + 8 = ... let's use message_size such that total = 50
-        // 27 + message_size = 50 → message_size = 23
         buf.push(make_event(23));
         let occ = buf.occupancy();
         assert!(occ > 0.0 && occ <= 1.0, "occupancy={occ}");
@@ -103,7 +129,7 @@ mod tests {
 
     #[test]
     fn buffer_empty_after_drain() {
-        let mut buf = BatchBuffer::new(DEFAULT_MAX_BYTES);
+        let mut buf = BatchBuffer::with_defaults();
         buf.push(make_event(10));
         buf.push(make_event(10));
         assert!(!buf.is_empty());
@@ -116,9 +142,7 @@ mod tests {
 
     #[test]
     fn oversized_event_flushes_immediately() {
-        // An event larger than max_bytes triggers a flush on that same push and
-        // resets the buffer to empty. Occupancy never gets stuck above 1.0.
-        let mut buf = BatchBuffer::new(10);
+        let mut buf = BatchBuffer::new(10, DEFAULT_MAX_RECORDS);
         let batch = buf.push(make_event(1000)).expect("oversized event should trigger flush");
         assert_eq!(batch.len(), 1);
         assert_eq!(buf.occupancy(), 0.0);
@@ -127,9 +151,6 @@ mod tests {
 
     #[test]
     fn attributes_contribute_to_byte_count() {
-        // Bare event (no attrs): 8+5+1+1+4+8 = 27 bytes.
-        // With {"key":"value", "count":42}: +8 (3+5) + 13 (5+8) = 48 bytes.
-        // Threshold of 40 sits between them — bare fits, attributed flushes.
         let make = |attrs: HashMap<String, AttributeValue>| LogEvent {
             timestamp: 0,
             level: Level::Debug,
@@ -140,13 +161,13 @@ mod tests {
             attributes: attrs,
         };
 
-        let mut bare_buf = BatchBuffer::new(40);
+        let mut bare_buf = BatchBuffer::new(40, DEFAULT_MAX_RECORDS);
         assert!(bare_buf.push(make(HashMap::new())).is_none(), "bare event should not flush");
 
         let mut attrs = HashMap::new();
         attrs.insert("key".to_string(), AttributeValue::String("value".to_string()));
         attrs.insert("count".to_string(), AttributeValue::Int(42));
-        let mut attr_buf = BatchBuffer::new(40);
+        let mut attr_buf = BatchBuffer::new(40, DEFAULT_MAX_RECORDS);
         assert!(attr_buf.push(make(attrs)).is_some(), "attributed event should flush");
     }
 }
