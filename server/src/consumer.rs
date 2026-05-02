@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use batch_buffer::BatchBuffer;
+use batch_buffer::{BatchBuffer, SystemClock, DEFAULT_MAX_AGE_MS, DEFAULT_MAX_RECORDS};
 use event_schema::LogEvent;
 use manifest::Manifest;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
@@ -16,10 +17,16 @@ use tokio::time::interval;
 
 use crate::flush_events;
 
+const HIGH_WATER_MARK: f32 = 0.8;
+const LOW_WATER_MARK: f32 = 0.4;
+
 pub struct ConsumerConfig {
     pub bootstrap_servers: String,
     pub group_id: String,
     pub topic: String,
+    /// Max batch size in bytes before a flush is triggered. Override in tests to
+    /// produce backpressure without requiring 64 MB of data.
+    pub batch_max_bytes: usize,
 }
 
 impl Default for ConsumerConfig {
@@ -31,6 +38,7 @@ impl Default for ConsumerConfig {
                 .unwrap_or_else(|_| "log-ingest".to_string()),
             topic: std::env::var("KAFKA_TOPIC")
                 .unwrap_or_else(|_| "logs".to_string()),
+            batch_max_bytes: batch_buffer::DEFAULT_MAX_BYTES,
         }
     }
 }
@@ -42,10 +50,14 @@ impl Default for ConsumerConfig {
 /// a flush completes, uncommitted events are re-consumed from Kafka on restart.
 /// Duplicates in the re-consumed window are removed at query time via
 /// (kafka_partition, kafka_offset) deduplication (issue #14).
+///
+/// `backpressure_pauses` is incremented each time the consumer pauses its
+/// Kafka partitions due to buffer occupancy exceeding the high-water mark.
 pub async fn run_consumer(
     config: ConsumerConfig,
     data_dir: PathBuf,
     manifest: Arc<Mutex<Manifest>>,
+    backpressure_pauses: Arc<AtomicU64>,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<()> {
     let consumer: StreamConsumer = ClientConfig::new()
@@ -59,11 +71,17 @@ pub async fn run_consumer(
     consumer.subscribe(&[&config.topic])?;
     tracing::info!("consumer subscribed to topic '{}'", config.topic);
 
-    let mut buffer = BatchBuffer::with_defaults();
+    let mut buffer = BatchBuffer::new(
+        config.batch_max_bytes,
+        DEFAULT_MAX_RECORDS,
+        DEFAULT_MAX_AGE_MS,
+        Box::new(SystemClock),
+    );
     // Tracks the next-to-read offset (last consumed + 1) per (topic, partition).
     // Reset after each successful commit so stale offsets are never re-committed.
     let mut pending: HashMap<(String, i32), i64> = HashMap::new();
     let mut tick = interval(Duration::from_millis(100));
+    let mut is_paused = false;
 
     loop {
         tokio::select! {
@@ -88,7 +106,14 @@ pub async fn run_consumer(
                                     if do_flush(&batch, &data_dir, &manifest).await {
                                         commit_offsets(&consumer, &pending);
                                         pending.clear();
+                                        if is_paused && buffer.occupancy() < LOW_WATER_MARK {
+                                            resume_partitions(&consumer);
+                                            is_paused = false;
+                                        }
                                     }
+                                } else if !is_paused && buffer.occupancy() > HIGH_WATER_MARK {
+                                    pause_partitions(&consumer, &backpressure_pauses);
+                                    is_paused = true;
                                 }
                             }
                         }
@@ -100,6 +125,10 @@ pub async fn run_consumer(
                     if do_flush(&batch, &data_dir, &manifest).await {
                         commit_offsets(&consumer, &pending);
                         pending.clear();
+                        if is_paused && buffer.occupancy() < LOW_WATER_MARK {
+                            resume_partitions(&consumer);
+                            is_paused = false;
+                        }
                     }
                 }
             }
@@ -153,5 +182,39 @@ fn commit_offsets(consumer: &StreamConsumer, pending: &HashMap<(String, i32), i6
         tracing::error!("offset commit failed: {e}");
     } else {
         tracing::debug!("committed offsets for {} partition(s)", pending.len());
+    }
+}
+
+/// Pause all currently assigned partitions. Called when buffer occupancy exceeds HIGH_WATER_MARK.
+fn pause_partitions(consumer: &StreamConsumer, pauses_total: &AtomicU64) {
+    match consumer.assignment() {
+        Ok(tpl) if !tpl.elements().is_empty() => {
+            if let Err(e) = consumer.pause(&tpl) {
+                tracing::error!("failed to pause partitions: {e}");
+            } else {
+                let count = pauses_total.fetch_add(1, Ordering::Relaxed) + 1;
+                tracing::info!(
+                    "backpressure: paused {} partition(s) (total pauses: {count})",
+                    tpl.count()
+                );
+            }
+        }
+        Ok(_) => {}
+        Err(e) => tracing::error!("failed to get assignment for pause: {e}"),
+    }
+}
+
+/// Resume all currently assigned partitions. Called after a flush drops occupancy below LOW_WATER_MARK.
+fn resume_partitions(consumer: &StreamConsumer) {
+    match consumer.assignment() {
+        Ok(tpl) if !tpl.elements().is_empty() => {
+            if let Err(e) = consumer.resume(&tpl) {
+                tracing::error!("failed to resume partitions: {e}");
+            } else {
+                tracing::info!("backpressure: resumed {} partition(s)", tpl.count());
+            }
+        }
+        Ok(_) => {}
+        Err(e) => tracing::error!("failed to get assignment for resume: {e}"),
     }
 }

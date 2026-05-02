@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -159,6 +160,7 @@ async fn main() {
             ConsumerConfig::default(),
             data_dir,
             consumer_manifest,
+            Arc::new(AtomicU64::new(0)),
             shutdown_rx,
         )
         .await
@@ -456,9 +458,11 @@ mod tests {
                     bootstrap_servers: "localhost:9092".to_string(),
                     group_id: format!("test-{}", uuid::Uuid::new_v4()),
                     topic: TOPIC.to_string(),
+                    ..ConsumerConfig::default()
                 },
                 consumer_data_dir,
                 consumer_manifest,
+                Arc::new(AtomicU64::new(0)),
                 shutdown_rx,
             )
             .await;
@@ -527,7 +531,8 @@ mod tests {
             let _ = run_consumer(ConsumerConfig {
                 bootstrap_servers: "localhost:9092".to_string(),
                 group_id: gid, topic: top,
-            }, dd, m2, rx).await;
+                ..ConsumerConfig::default()
+            }, dd, m2, Arc::new(AtomicU64::new(0)), rx).await;
         });
         tokio::time::sleep(Duration::from_secs(3)).await;
         let _ = tx.send(());
@@ -559,7 +564,6 @@ mod tests {
         use rdkafka::config::ClientConfig;
         use rdkafka::consumer::{Consumer, StreamConsumer};
         use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
-        use rdkafka::message::Message;
         use std::time::Duration;
 
         let topic = format!("test-reprocess-{}", uuid::Uuid::new_v4());
@@ -615,7 +619,8 @@ mod tests {
             let _ = run_consumer(ConsumerConfig {
                 bootstrap_servers: "localhost:9092".to_string(),
                 group_id: gid, topic: top,
-            }, dd, m2, rx).await;
+                ..ConsumerConfig::default()
+            }, dd, m2, Arc::new(AtomicU64::new(0)), rx).await;
         });
         tokio::time::sleep(Duration::from_secs(3)).await;
         let _ = tx.send(());
@@ -628,5 +633,112 @@ mod tests {
             time_from: Some(0), time_to: Some(i64::MAX), limit: 1000,
         }).await.unwrap();
         assert_eq!(rows.len(), N, "expected {N} events after re-consumption, got {}", rows.len());
+    }
+
+    /// Verify that buffer backpressure pauses and resumes the Kafka consumer without
+    /// dropping events. Uses a tiny batch buffer (500 bytes) so that two events
+    /// (~240 bytes each) push occupancy above the 0.8 high-water mark, triggering
+    /// a pause before the third event is polled.
+    ///
+    /// Requires the Docker Compose stack: `make up`
+    /// Run with: cargo test -p server -- --ignored backpressure
+    #[tokio::test]
+    #[ignore]
+    async fn backpressure_pauses_and_resumes_without_dropping_events() {
+        use rdkafka::config::ClientConfig as RdkConfig;
+        use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
+
+        // ~240 bytes/event estimated; 500-byte limit means 2 events reach 96% occupancy
+        // (> 0.8 high-water mark) without triggering a size flush, so pause fires.
+        const BATCH_MAX_BYTES: usize = 500;
+        const N: usize = 6;
+
+        let topic = format!("test-bp-{}", uuid::Uuid::new_v4());
+        let group_id = format!("test-bp-grp-{}", uuid::Uuid::new_v4());
+
+        let producer: BaseProducer = RdkConfig::new()
+            .set("bootstrap.servers", "localhost:9092")
+            .set("message.timeout.ms", "5000")
+            .create()
+            .unwrap();
+
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+
+        for i in 0..N {
+            let event = serde_json::json!({
+                "timestamp": now_ns + i as i64,
+                "level": "INFO",
+                "service": "bp-test",
+                // ~220-char message → estimated ~240 bytes per event
+                "message": "x".repeat(220),
+                "kafka_partition": 0,
+                "kafka_offset": i,
+                "attributes": {}
+            });
+            producer
+                .send(BaseRecord::to(&topic).payload(&event.to_string()).key(&format!("{i}")))
+                .expect("send failed");
+        }
+        producer.flush(Duration::from_secs(5)).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let manifest = Arc::new(Mutex::new(
+            Manifest::open(&dir.path().join("manifest.db")).unwrap(),
+        ));
+        let (tx, rx) = tokio::sync::broadcast::channel::<()>(1);
+        let m2 = Arc::clone(&manifest);
+        let dd = data_dir.clone();
+        let pauses = Arc::new(AtomicU64::new(0));
+        let pauses_clone = Arc::clone(&pauses);
+
+        tokio::spawn(async move {
+            let _ = run_consumer(
+                ConsumerConfig {
+                    bootstrap_servers: "localhost:9092".to_string(),
+                    group_id,
+                    topic,
+                    batch_max_bytes: BATCH_MAX_BYTES,
+                },
+                dd,
+                m2,
+                pauses_clone,
+                rx,
+            )
+            .await;
+        });
+
+        // Each pause/resume cycle takes ~1 s (the age trigger). With N=6 events and
+        // 2 events per cycle, we expect ~3 cycles. Wait 10 s to be safe on slow CI.
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let _ = tx.send(());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        assert!(
+            pauses.load(Ordering::Relaxed) > 0,
+            "expected at least one backpressure pause"
+        );
+
+        let state = AppState { manifest };
+        let rows = run_query(
+            state,
+            QueryRequest {
+                sql: "SELECT * FROM logs".to_string(),
+                time_from: Some(0),
+                time_to: Some(i64::MAX),
+                limit: 1000,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rows.len(),
+            N,
+            "expected {N} events after backpressure cycles, got {}",
+            rows.len()
+        );
     }
 }
