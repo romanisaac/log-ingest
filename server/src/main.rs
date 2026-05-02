@@ -234,7 +234,7 @@ mod tests {
 
         // Use a threshold small enough that a single make_event() push triggers a flush.
         // make_event() estimated size is well over 100 bytes.
-        let mut buf = BatchBuffer::new(100, batch_buffer::DEFAULT_MAX_RECORDS);
+        let mut buf = BatchBuffer::new(100, batch_buffer::DEFAULT_MAX_RECORDS, batch_buffer::DEFAULT_MAX_AGE_MS, Box::new(batch_buffer::SystemClock));
         let batch = buf.push(make_event()).expect("event should trigger flush");
         assert_eq!(batch.len(), 1);
         assert!(buf.is_empty());
