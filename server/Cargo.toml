@@ -27,6 +27,8 @@ parquet = "53.4"
 arrow = { version = "53.4", features = ["ipc"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
 
 [dev-dependencies]
 tempfile = "3"

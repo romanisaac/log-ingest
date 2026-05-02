@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,7 +11,7 @@ use datafusion::prelude::*;
 use manifest::Manifest;
 use serde::Deserialize;
 use server::{run_consumer, ConsumerConfig};
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, Mutex, Semaphore};
 
 // ─── HTTP API ────────────────────────────────────────────────────────────────
 
@@ -141,6 +141,10 @@ async fn main() {
         )
         .init();
 
+    let prometheus_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .install_recorder()
+        .expect("failed to install Prometheus recorder");
+
     let data_dir = PathBuf::from(
         std::env::var("DATA_DIR").unwrap_or_else(|_| "data".to_string()),
     );
@@ -153,14 +157,22 @@ async fn main() {
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
 
+    let max_concurrent_flushes = std::env::var("MAX_CONCURRENT_FLUSHES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4usize);
+    let flush_semaphore = Arc::new(Semaphore::new(max_concurrent_flushes));
+
     // Start Kafka consumer as a background task.
     let consumer_manifest = Arc::clone(&manifest);
+    let consumer_semaphore = Arc::clone(&flush_semaphore);
     tokio::spawn(async move {
         if let Err(e) = run_consumer(
             ConsumerConfig::default(),
             data_dir,
             consumer_manifest,
             Arc::new(AtomicU64::new(0)),
+            consumer_semaphore,
             shutdown_rx,
         )
         .await
@@ -173,6 +185,10 @@ async fn main() {
     let app = Router::new()
         .route("/query", post(query_handler))
         .route("/health", axum::routing::get(|| async { "ok" }))
+        .route("/metrics", axum::routing::get({
+            let handle = prometheus_handle.clone();
+            move || { let h = handle.clone(); async move { h.render() } }
+        }))
         .with_state(state);
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
@@ -199,6 +215,7 @@ mod tests {
     use super::*;
     use event_schema::{AttributeValue, Level, LogEvent};
     use server::flush_events;
+    use std::sync::atomic::Ordering;
     use std::collections::HashMap;
     use tower::util::ServiceExt;
 
@@ -463,6 +480,7 @@ mod tests {
                 consumer_data_dir,
                 consumer_manifest,
                 Arc::new(AtomicU64::new(0)),
+                Arc::new(Semaphore::new(4)),
                 shutdown_rx,
             )
             .await;
@@ -532,7 +550,7 @@ mod tests {
                 bootstrap_servers: "localhost:9092".to_string(),
                 group_id: gid, topic: top,
                 ..ConsumerConfig::default()
-            }, dd, m2, Arc::new(AtomicU64::new(0)), rx).await;
+            }, dd, m2, Arc::new(AtomicU64::new(0)), Arc::new(Semaphore::new(4)), rx).await;
         });
         tokio::time::sleep(Duration::from_secs(3)).await;
         let _ = tx.send(());
@@ -620,7 +638,7 @@ mod tests {
                 bootstrap_servers: "localhost:9092".to_string(),
                 group_id: gid, topic: top,
                 ..ConsumerConfig::default()
-            }, dd, m2, Arc::new(AtomicU64::new(0)), rx).await;
+            }, dd, m2, Arc::new(AtomicU64::new(0)), Arc::new(Semaphore::new(4)), rx).await;
         });
         tokio::time::sleep(Duration::from_secs(3)).await;
         let _ = tx.send(());
@@ -707,6 +725,7 @@ mod tests {
                 dd,
                 m2,
                 pauses_clone,
+                Arc::new(Semaphore::new(4)),
                 rx,
             )
             .await;
