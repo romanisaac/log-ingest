@@ -93,6 +93,58 @@ impl Manifest {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Return active hot-tier files whose max_ts is strictly before `cutoff_ns`.
+    pub fn hot_files_older_than(&self, cutoff_ns: i64) -> Result<Vec<FileEntry>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, path, tier, service, time_bucket, min_ts, max_ts,
+                        size_bytes, record_count, state, min_kafka_offset, max_kafka_offset
+                 FROM files WHERE state = 'active' AND tier = 'hot' AND max_ts < ?1",
+            )
+            .context("prepare hot_files_older_than")?;
+        let rows = stmt
+            .query_map(params![cutoff_ns], map_row)
+            .context("query hot_files_older_than")?
+            .collect::<std::result::Result<_, _>>()
+            .context("collect rows")?;
+        Ok(rows)
+    }
+
+    /// Promote a file to the cold tier, updating its path to the object-store URI.
+    /// This is atomic: tier and path change in a single UPDATE.
+    pub fn set_cold(&mut self, id: i64, cold_path: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE files SET tier = 'cold', path = ?1 WHERE id = ?2",
+                params![cold_path, id],
+            )
+            .context("set_cold")?;
+        Ok(())
+    }
+
+    /// Count active files grouped by tier. Returns (hot_count, cold_count).
+    pub fn count_active_by_tier(&self) -> Result<(u64, u64)> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT tier, COUNT(*) FROM files WHERE state = 'active' GROUP BY tier")
+            .context("prepare count_active_by_tier")?;
+        let mut hot = 0u64;
+        let mut cold = 0u64;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+            .context("query count_active_by_tier")?;
+        for row in rows {
+            let (tier, count) = row.context("read tier count row")?;
+            match tier.as_str() {
+                "hot" => hot = count as u64,
+                "cold" => cold = count as u64,
+                _ => {}
+            }
+        }
+        Ok((hot, cold))
+    }
+
     /// Return paths of all active files, optionally filtered by service.
     pub fn active_files(&self, service: Option<&str>) -> Result<Vec<FileEntry>> {
         let mut stmt = if let Some(svc) = service {

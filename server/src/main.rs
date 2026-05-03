@@ -19,7 +19,8 @@ use datafusion::prelude::*;
 use futures::{channel::mpsc, StreamExt};
 use manifest::Manifest;
 use serde::Deserialize;
-use server::{run_consumer, ConsumerConfig};
+use server::{run_consumer, run_tiering, ConsumerConfig, TieringConfig};
+use storage::MinioConfig;
 use tokio::sync::{broadcast, Mutex, Semaphore};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -77,7 +78,10 @@ async fn stream_query(
 ) -> Result<impl futures::Stream<Item = Result<Bytes, BoxError>> + Send + 'static> {
     let files = {
         let guard = state.manifest.lock().await;
-        guard.active_files(None)?
+        // Cold-tier files have object store URIs that DataFusion cannot read without
+        // a registered object store. Restrict to hot-only until issue #22 (cross-tier
+        // queries) is implemented.
+        guard.active_files(None)?.into_iter().filter(|f| f.tier == "hot").collect::<Vec<_>>()
     };
 
     let time_from = req.time_from.unwrap();
@@ -241,7 +245,7 @@ async fn main() {
         Manifest::open(Path::new(&db_path)).expect("open manifest"),
     ));
 
-    let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
+    let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
     let max_concurrent_flushes = std::env::var("MAX_CONCURRENT_FLUSHES")
         .ok()
@@ -252,6 +256,7 @@ async fn main() {
     // Start Kafka consumer as a background task.
     let consumer_manifest = Arc::clone(&manifest);
     let consumer_semaphore = Arc::clone(&flush_semaphore);
+    let consumer_shutdown = shutdown_tx.subscribe();
     tokio::spawn(async move {
         if let Err(e) = run_consumer(
             ConsumerConfig::default(),
@@ -259,11 +264,40 @@ async fn main() {
             consumer_manifest,
             Arc::new(AtomicU64::new(0)),
             consumer_semaphore,
-            shutdown_rx,
+            consumer_shutdown,
         )
         .await
         {
             tracing::error!("consumer exited with error: {e:#}");
+        }
+    });
+
+    // Start background tiering task.
+    let tiering_manifest = Arc::clone(&manifest);
+    let tiering_shutdown = shutdown_tx.subscribe();
+    let tiering_config = TieringConfig {
+        minio: MinioConfig {
+            endpoint: std::env::var("MINIO_ENDPOINT")
+                .unwrap_or_else(|_| "http://localhost:9000".to_string()),
+            access_key: std::env::var("MINIO_ACCESS_KEY")
+                .unwrap_or_else(|_| "minioadmin".to_string()),
+            secret_key: std::env::var("MINIO_SECRET_KEY")
+                .unwrap_or_else(|_| "minioadmin".to_string()),
+            bucket: std::env::var("MINIO_BUCKET")
+                .unwrap_or_else(|_| "logs".to_string()),
+        },
+        threshold_days: std::env::var("TIER_THRESHOLD_DAYS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(7),
+        interval_secs: std::env::var("TIER_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60),
+    };
+    tokio::spawn(async move {
+        if let Err(e) = run_tiering(tiering_config, tiering_manifest, tiering_shutdown).await {
+            tracing::error!("tiering task exited with error: {e:#}");
         }
     });
 
@@ -1108,6 +1142,79 @@ mod tests {
             .map(|r| r["kafka_offset"].as_i64().unwrap())
             .collect();
         assert_eq!(offsets.len(), N, "duplicate events detected after rebalance");
+    }
+
+    /// Flush events, then run tiering with threshold_days=0 so all hot files are immediately
+    /// eligible. Assert the file appears in MinIO and is removed locally.
+    /// Requires MinIO running: `make up`
+    /// Run with: cargo test -p server -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn tiering_moves_hot_files_to_minio() {
+        use object_store::path::Path as ObjPath;
+        use server::{run_tiering, TieringConfig};
+        use storage::{minio_store, MinioConfig};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("manifest.db");
+        let data_dir = dir.path().join("data");
+
+        let event = make_event();
+        let mut manifest = Manifest::open(&db_path).unwrap();
+        flush_events(&[event], &data_dir, &mut manifest).unwrap();
+
+        let hot_files = manifest.active_files(None).unwrap();
+        assert_eq!(hot_files.len(), 1);
+        let hot_path = hot_files[0].path.clone();
+        assert!(
+            std::path::Path::new(&hot_path).exists(),
+            "hot file must exist before tiering"
+        );
+
+        let manifest = Arc::new(Mutex::new(manifest));
+        let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
+
+        // threshold_days=0 → cutoff = now, so any file with max_ts < now is eligible.
+        // interval_secs=0 → sleep resolves immediately; first pass fires right away.
+        let tiering_config = TieringConfig {
+            minio: MinioConfig::default(),
+            threshold_days: 0,
+            interval_secs: 0,
+        };
+
+        let tiering_manifest = Arc::clone(&manifest);
+        let handle = tokio::spawn(async move {
+            run_tiering(tiering_config, tiering_manifest, shutdown_rx).await
+        });
+
+        // Allow at least one tiering pass to complete, then shut down.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let _ = shutdown_tx.send(());
+        handle.await.unwrap().unwrap();
+
+        // Local file must be gone.
+        assert!(
+            !std::path::Path::new(&hot_path).exists(),
+            "local file must be removed after tiering"
+        );
+
+        // Manifest must reflect the file as cold with an S3 URI.
+        let files = manifest.lock().await.active_files(None).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].tier, "cold");
+        assert!(files[0].path.starts_with("s3://"), "cold path must be an S3 URI");
+
+        // File must be readable from MinIO.
+        let minio_config = MinioConfig::default();
+        let store = minio_store(&minio_config).unwrap();
+        let cold_key = files[0].path
+            .strip_prefix(&format!("s3://{}/", minio_config.bucket))
+            .expect("cold path must start with bucket prefix");
+        let obj_path = ObjPath::from(cold_key);
+        store.get(&obj_path).await.expect("file must be readable from MinIO");
+
+        // Cleanup MinIO object so repeated test runs don't accumulate objects.
+        store.delete(&obj_path).await.unwrap();
     }
 
     /// Verify that buffer backpressure pauses and resumes the Kafka consumer without
