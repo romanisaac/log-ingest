@@ -16,7 +16,7 @@ use axum::{
 };
 use bytes::Bytes;
 use datafusion::prelude::*;
-use futures::StreamExt;
+use futures::{channel::mpsc, StreamExt};
 use manifest::Manifest;
 use serde::Deserialize;
 use server::{run_consumer, ConsumerConfig};
@@ -80,8 +80,25 @@ async fn stream_query(
         guard.active_files(None)?
     };
 
+    let time_from = req.time_from.unwrap();
+    let time_to = req.time_to.unwrap();
+
+    // Compute file-level stats from manifest metadata before touching DataFusion.
+    let files_pruned = files
+        .iter()
+        .filter(|f| f.max_ts < time_from || f.min_ts > time_to)
+        .count() as u64;
+    let bytes_scanned: u64 = files
+        .iter()
+        .filter(|f| !(f.max_ts < time_from || f.min_ts > time_to))
+        .map(|f| f.size_bytes as u64)
+        .sum();
+
     if files.is_empty() {
-        return Ok(futures::stream::empty::<Result<Bytes, BoxError>>().boxed());
+        return Ok(futures::stream::once(futures::future::ready(Ok(
+            make_stats_bytes(0, 0, 0, 0),
+        )))
+        .boxed());
     }
 
     let ctx = SessionContext::new();
@@ -116,34 +133,67 @@ async fn stream_query(
         .await
         .context("execute query")?;
 
-    let ndjson_stream = batch_stream.flat_map(|batch_result| {
-        match batch_result {
-            Err(e) => futures::stream::once(futures::future::ready(
-                Err::<Bytes, BoxError>(Box::new(e)),
-            ))
-            .boxed(),
-            Ok(batch) => {
-                let schema = batch.schema();
-                let lines: Vec<Result<Bytes, BoxError>> = (0..batch.num_rows())
-                    .map(|row_idx| {
+    let (tx, rx) = mpsc::unbounded::<Result<Bytes, BoxError>>();
+    let started_at = std::time::Instant::now();
+
+    tokio::spawn(async move {
+        let mut stream = batch_stream;
+        let mut rows_scanned = 0u64;
+
+        while let Some(result) = stream.next().await {
+            match result {
+                Err(e) => {
+                    tx.unbounded_send(Err(Box::new(e) as BoxError)).ok();
+                    return;
+                }
+                Ok(batch) => {
+                    rows_scanned += batch.num_rows() as u64;
+                    let schema = batch.schema();
+                    for row_idx in 0..batch.num_rows() {
                         let mut obj = serde_json::Map::new();
                         for col_idx in 0..batch.num_columns() {
                             let val = arrow_value_to_json(batch.column(col_idx), row_idx)
                                 .unwrap_or(serde_json::Value::Null);
                             obj.insert(schema.field(col_idx).name().clone(), val);
                         }
-                        let mut line = serde_json::to_string(&serde_json::Value::Object(obj))
-                            .map_err(|e| Box::new(e) as BoxError)?;
-                        line.push('\n');
-                        Ok(Bytes::from(line))
-                    })
-                    .collect();
-                futures::stream::iter(lines).boxed()
+                        match serde_json::to_string(&serde_json::Value::Object(obj)) {
+                            Err(e) => {
+                                tx.unbounded_send(Err(Box::new(e) as BoxError)).ok();
+                                return;
+                            }
+                            Ok(mut line) => {
+                                line.push('\n');
+                                tx.unbounded_send(Ok(Bytes::from(line))).ok();
+                            }
+                        }
+                    }
+                }
             }
         }
+
+        let duration_ms = started_at.elapsed().as_millis() as u64;
+        tx.unbounded_send(Ok(make_stats_bytes(
+            rows_scanned,
+            files_pruned,
+            bytes_scanned,
+            duration_ms,
+        )))
+        .ok();
     });
 
-    Ok(ndjson_stream.boxed())
+    Ok(rx.boxed())
+}
+
+fn make_stats_bytes(rows_scanned: u64, files_pruned: u64, bytes_scanned: u64, duration_ms: u64) -> Bytes {
+    let mut s = serde_json::json!({
+        "rows_scanned": rows_scanned,
+        "files_pruned": files_pruned,
+        "bytes_scanned": bytes_scanned,
+        "duration_ms": duration_ms,
+    })
+    .to_string();
+    s.push('\n');
+    Bytes::from(s)
 }
 
 fn arrow_value_to_json(col: &dyn Array, row: usize) -> Result<serde_json::Value> {
@@ -253,7 +303,8 @@ mod tests {
     use std::collections::HashMap;
     use tower::util::ServiceExt;
 
-    async fn query_rows(state: AppState, req: QueryRequest) -> Vec<serde_json::Value> {
+    // Returns (data_rows, stats) from a query response.
+    async fn query(state: AppState, req: QueryRequest) -> (Vec<serde_json::Value>, serde_json::Value) {
         let app = Router::new()
             .route("/query", post(query_handler))
             .with_state(state);
@@ -277,11 +328,17 @@ mod tests {
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        bytes
+        let mut lines: Vec<serde_json::Value> = bytes
             .split(|&b| b == b'\n')
             .filter(|line| !line.is_empty())
             .map(|line| serde_json::from_slice(line).unwrap())
-            .collect()
+            .collect();
+        let stats = lines.pop().expect("response must include a trailing stats line");
+        (lines, stats)
+    }
+
+    async fn query_rows(state: AppState, req: QueryRequest) -> Vec<serde_json::Value> {
+        query(state, req).await.0
     }
 
     fn make_event() -> LogEvent {
@@ -319,7 +376,7 @@ mod tests {
         let state = AppState { manifest: Arc::new(Mutex::new(manifest)) };
         let app = Router::new()
             .route("/query", post(query_handler))
-            .with_state(state);
+            .with_state(state.clone());
 
         let body = serde_json::json!({
             "sql": "SELECT * FROM logs",
@@ -346,16 +403,18 @@ mod tests {
             "application/x-ndjson"
         );
 
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let rows: Vec<serde_json::Value> = bytes
-            .split(|&b| b == b'\n')
-            .filter(|line| !line.is_empty())
-            .map(|line| serde_json::from_slice(line).unwrap())
-            .collect();
-        assert_eq!(rows.len(), 1);
+        let (rows, stats) = query(
+            state,
+            QueryRequest {
+                sql: "SELECT * FROM logs".to_string(),
+                time_from: Some(0),
+                time_to: Some(i64::MAX),
+                limit: 100,
+            },
+        )
+        .await;
 
+        assert_eq!(rows.len(), 1);
         let row = &rows[0];
         assert_eq!(row["timestamp"], serde_json::json!(1_700_000_000_000_000_000i64));
         assert_eq!(row["level"], serde_json::json!("INFO"));
@@ -369,6 +428,11 @@ mod tests {
         assert_eq!(attrs["request_id"], AttributeValue::String("test-req-1".to_string()));
         assert_eq!(attrs["status_code"], AttributeValue::Int(200));
         assert_eq!(attrs["cached"], AttributeValue::Bool(true));
+
+        assert_eq!(stats["rows_scanned"], serde_json::json!(1u64));
+        assert_eq!(stats["files_pruned"], serde_json::json!(0u64));
+        assert!(stats["bytes_scanned"].as_u64().unwrap() > 0);
+        assert!(stats["duration_ms"].as_u64().is_some());
     }
 
     #[test]
@@ -468,6 +532,57 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn files_pruned_reflects_out_of_range_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("manifest.db");
+        let data_dir = dir.path().join("data");
+        let mut manifest = Manifest::open(&db_path).unwrap();
+
+        // 4 files: 2 inside [0, 3_000], 2 outside. Each flush produces one file,
+        // so files_pruned must count exactly 2 — not just "non-zero" or "total minus one".
+        let make = |ts: i64, offset: i64| LogEvent {
+            timestamp: ts,
+            level: Level::Info,
+            service: "svc".to_string(),
+            message: "msg".to_string(),
+            kafka_partition: 0,
+            kafka_offset: offset,
+            attributes: HashMap::new(),
+        };
+        flush_events(&[make(1_000, 0)], &data_dir, &mut manifest).unwrap();
+        flush_events(&[make(2_000, 1)], &data_dir, &mut manifest).unwrap();
+        flush_events(&[make(5_000, 2)], &data_dir, &mut manifest).unwrap();
+        flush_events(&[make(6_000, 3)], &data_dir, &mut manifest).unwrap();
+
+        let all_files = manifest.active_files(None).unwrap();
+        assert_eq!(all_files.len(), 4);
+
+        // Expected bytes: sum of size_bytes for the 2 in-range files only.
+        let expected_bytes: u64 = all_files
+            .iter()
+            .filter(|f| !(f.max_ts < 0 || f.min_ts > 3_000))
+            .map(|f| f.size_bytes as u64)
+            .sum();
+
+        let state = AppState { manifest: Arc::new(Mutex::new(manifest)) };
+        // SQL WHERE clause matches time_to so rows_scanned reflects only in-range rows.
+        let (_, stats) = query(
+            state,
+            QueryRequest {
+                sql: "SELECT * FROM logs WHERE timestamp <= 3000".to_string(),
+                time_from: Some(0),
+                time_to: Some(3_000),
+                limit: 100,
+            },
+        )
+        .await;
+
+        assert_eq!(stats["files_pruned"], serde_json::json!(2u64));
+        assert_eq!(stats["rows_scanned"], serde_json::json!(2u64));
+        assert_eq!(stats["bytes_scanned"], serde_json::json!(expected_bytes));
     }
 
     /// Requires MinIO running: `make up`
