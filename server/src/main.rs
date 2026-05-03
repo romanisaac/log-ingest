@@ -84,15 +84,11 @@ async fn stream_query(
     let time_to = req.time_to.unwrap();
 
     // Compute file-level stats from manifest metadata before touching DataFusion.
-    let files_pruned = files
-        .iter()
-        .filter(|f| f.max_ts < time_from || f.min_ts > time_to)
-        .count() as u64;
-    let bytes_scanned: u64 = files
-        .iter()
-        .filter(|f| !(f.max_ts < time_from || f.min_ts > time_to))
-        .map(|f| f.size_bytes as u64)
-        .sum();
+    let is_pruned = |f: &&manifest::FileEntry| f.max_ts < time_from || f.min_ts > time_to;
+    let files_pruned = files.iter().filter(is_pruned).count() as u64;
+    let bytes_scanned: u64 = files.iter().filter(|f| !is_pruned(f)).map(|f| f.size_bytes as u64).sum();
+    // Pre-dedup row count: total records in all non-pruned files per manifest.
+    let rows_scanned: u64 = files.iter().filter(|f| !is_pruned(f)).map(|f| f.record_count as u64).sum();
 
     if files.is_empty() {
         return Ok(futures::stream::once(futures::future::ready(Ok(
@@ -117,7 +113,15 @@ async fn stream_query(
         .map(|t| format!("SELECT * FROM {t}"))
         .collect::<Vec<_>>()
         .join(" UNION ALL ");
-    ctx.sql(&format!("CREATE OR REPLACE VIEW logs AS {union_sql}"))
+    // Deduplicate at the view level so any user projection gets duplicate-free data.
+    let view_sql = format!(
+        "SELECT * EXCEPT (_rn) FROM (\
+            SELECT *, ROW_NUMBER() OVER \
+                (PARTITION BY kafka_partition, kafka_offset ORDER BY timestamp) AS _rn \
+            FROM ({union_sql})\
+        ) WHERE _rn = 1"
+    );
+    ctx.sql(&format!("CREATE OR REPLACE VIEW logs AS {view_sql}"))
         .await
         .context("create logs view")?
         .collect()
@@ -138,7 +142,6 @@ async fn stream_query(
 
     tokio::spawn(async move {
         let mut stream = batch_stream;
-        let mut rows_scanned = 0u64;
 
         while let Some(result) = stream.next().await {
             match result {
@@ -147,7 +150,6 @@ async fn stream_query(
                     return;
                 }
                 Ok(batch) => {
-                    rows_scanned += batch.num_rows() as u64;
                     let schema = batch.schema();
                     for row_idx in 0..batch.num_rows() {
                         let mut obj = serde_json::Map::new();
@@ -583,6 +585,110 @@ mod tests {
         assert_eq!(stats["files_pruned"], serde_json::json!(2u64));
         assert_eq!(stats["rows_scanned"], serde_json::json!(2u64));
         assert_eq!(stats["bytes_scanned"], serde_json::json!(expected_bytes));
+    }
+
+    #[tokio::test]
+    async fn dedup_removes_duplicate_partition_offset_pairs() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("manifest.db");
+        let data_dir = dir.path().join("data");
+        let mut manifest = Manifest::open(&db_path).unwrap();
+
+        // Two files containing the same (kafka_partition=0, kafka_offset=1) event —
+        // simulates Kafka replay after a crash where the flush committed but the
+        // offset commit did not.
+        let duplicate = LogEvent {
+            timestamp: 1_000,
+            level: Level::Info,
+            service: "svc".to_string(),
+            message: "replayed event".to_string(),
+            kafka_partition: 0,
+            kafka_offset: 1,
+            attributes: HashMap::new(),
+        };
+        let unique = LogEvent {
+            timestamp: 2_000,
+            level: Level::Info,
+            service: "svc".to_string(),
+            message: "unique event".to_string(),
+            kafka_partition: 0,
+            kafka_offset: 2,
+            attributes: HashMap::new(),
+        };
+
+        // File 1: contains the duplicate and the unique event.
+        flush_events(&[duplicate.clone(), unique.clone()], &data_dir, &mut manifest).unwrap();
+        // File 2: contains only the duplicate (the replayed copy).
+        flush_events(&[duplicate.clone()], &data_dir, &mut manifest).unwrap();
+
+        let state = AppState { manifest: Arc::new(Mutex::new(manifest)) };
+        let (rows, stats) = query(
+            state,
+            QueryRequest {
+                sql: "SELECT * FROM logs ORDER BY kafka_offset".to_string(),
+                time_from: Some(0),
+                time_to: Some(i64::MAX),
+                limit: 100,
+            },
+        )
+        .await;
+
+        // 3 rows from DataFusion (2 from file 1, 1 from file 2), 2 after dedup.
+        assert_eq!(stats["rows_scanned"], serde_json::json!(3u64), "rows_scanned is pre-dedup");
+        assert_eq!(rows.len(), 2, "result contains each event exactly once");
+
+        // Verify the two distinct events are present and in order.
+        assert_eq!(rows[0]["kafka_offset"], serde_json::json!(1i64));
+        assert_eq!(rows[1]["kafka_offset"], serde_json::json!(2i64));
+
+        // No duplicate (partition, offset) pairs in the result.
+        let keys: std::collections::HashSet<(i64, i64)> = rows
+            .iter()
+            .map(|r| (r["kafka_partition"].as_i64().unwrap(), r["kafka_offset"].as_i64().unwrap()))
+            .collect();
+        assert_eq!(keys.len(), rows.len(), "no duplicate (partition, offset) pairs");
+    }
+
+    #[tokio::test]
+    async fn dedup_works_with_partial_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("manifest.db");
+        let data_dir = dir.path().join("data");
+        let mut manifest = Manifest::open(&db_path).unwrap();
+
+        // Same (partition, offset) pair in two files — genuine duplicates.
+        let event = LogEvent {
+            timestamp: 1_000,
+            level: Level::Info,
+            service: "svc".to_string(),
+            message: "dup".to_string(),
+            kafka_partition: 0,
+            kafka_offset: 1,
+            attributes: HashMap::new(),
+        };
+        flush_events(&[event.clone()], &data_dir, &mut manifest).unwrap();
+        flush_events(&[event.clone()], &data_dir, &mut manifest).unwrap();
+
+        let state = AppState { manifest: Arc::new(Mutex::new(manifest)) };
+        // Projection omits kafka_partition and kafka_offset — dedup still fires
+        // because it happens in the view before the user's projection.
+        let (rows, stats) = query(
+            state,
+            QueryRequest {
+                sql: "SELECT message, timestamp FROM logs".to_string(),
+                time_from: Some(0),
+                time_to: Some(i64::MAX),
+                limit: 100,
+            },
+        )
+        .await;
+
+        // rows_scanned is total records across non-pruned files (pre-dedup).
+        assert_eq!(stats["rows_scanned"], serde_json::json!(2u64));
+        // Duplicate removed even though key columns are not in the projection.
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].get("message").is_some());
+        assert!(rows[0].get("kafka_partition").is_none());
     }
 
     /// Requires MinIO running: `make up`
