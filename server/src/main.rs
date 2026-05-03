@@ -41,6 +41,8 @@ fn default_limit() -> usize { 1000 }
 #[derive(Clone)]
 struct AppState {
     manifest: Arc<Mutex<Manifest>>,
+    minio: MinioConfig,
+    cold_semaphore: Arc<Semaphore>,
 }
 
 async fn query_handler(
@@ -78,10 +80,7 @@ async fn stream_query(
 ) -> Result<impl futures::Stream<Item = Result<Bytes, BoxError>> + Send + 'static> {
     let files = {
         let guard = state.manifest.lock().await;
-        // Cold-tier files have object store URIs that DataFusion cannot read without
-        // a registered object store. Restrict to hot-only until issue #22 (cross-tier
-        // queries) is implemented.
-        guard.active_files(None)?.into_iter().filter(|f| f.tier == "hot").collect::<Vec<_>>()
+        guard.active_files(None)?
     };
 
     let time_from = req.time_from.unwrap();
@@ -102,6 +101,25 @@ async fn stream_query(
     }
 
     let ctx = SessionContext::new();
+
+    // Register the MinIO object store once if any cold files are present so
+    // DataFusion can resolve s3:// URIs.  Acquire a cold semaphore permit that is
+    // held for the lifetime of the query to cap concurrent cold-tier I/O.
+    let has_cold = files.iter().any(|f| f.tier == "cold");
+    let cold_permit = if has_cold {
+        let store = storage::minio_store(&state.minio).context("build MinIO store")?;
+        let minio_url = url::Url::parse(&format!("s3://{}", state.minio.bucket))
+            .context("parse MinIO URL")?;
+        ctx.register_object_store(&minio_url, store);
+        Some(
+            Arc::clone(&state.cold_semaphore)
+                .acquire_owned()
+                .await
+                .context("acquire cold semaphore")?,
+        )
+    } else {
+        None
+    };
 
     let mut table_names: Vec<String> = Vec::new();
     for (i, entry) in files.iter().enumerate() {
@@ -145,6 +163,9 @@ async fn stream_query(
     let started_at = std::time::Instant::now();
 
     tokio::spawn(async move {
+        // Hold the cold permit for the full duration of the scan so that at most
+        // `cold_semaphore.available_permits()` queries read from cold storage at once.
+        let _cold_permit = cold_permit;
         let mut stream = batch_stream;
 
         while let Some(result) = stream.next().await {
@@ -272,20 +293,22 @@ async fn main() {
         }
     });
 
+    let minio_config = MinioConfig {
+        endpoint: std::env::var("MINIO_ENDPOINT")
+            .unwrap_or_else(|_| "http://localhost:9000".to_string()),
+        access_key: std::env::var("MINIO_ACCESS_KEY")
+            .unwrap_or_else(|_| "minioadmin".to_string()),
+        secret_key: std::env::var("MINIO_SECRET_KEY")
+            .unwrap_or_else(|_| "minioadmin".to_string()),
+        bucket: std::env::var("MINIO_BUCKET")
+            .unwrap_or_else(|_| "logs".to_string()),
+    };
+
     // Start background tiering task.
     let tiering_manifest = Arc::clone(&manifest);
     let tiering_shutdown = shutdown_tx.subscribe();
     let tiering_config = TieringConfig {
-        minio: MinioConfig {
-            endpoint: std::env::var("MINIO_ENDPOINT")
-                .unwrap_or_else(|_| "http://localhost:9000".to_string()),
-            access_key: std::env::var("MINIO_ACCESS_KEY")
-                .unwrap_or_else(|_| "minioadmin".to_string()),
-            secret_key: std::env::var("MINIO_SECRET_KEY")
-                .unwrap_or_else(|_| "minioadmin".to_string()),
-            bucket: std::env::var("MINIO_BUCKET")
-                .unwrap_or_else(|_| "logs".to_string()),
-        },
+        minio: minio_config.clone(),
         threshold_days: std::env::var("TIER_THRESHOLD_DAYS")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -301,7 +324,15 @@ async fn main() {
         }
     });
 
-    let state = AppState { manifest };
+    let cold_concurrency = std::env::var("COLD_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4usize);
+    let state = AppState {
+        manifest,
+        minio: minio_config,
+        cold_semaphore: Arc::new(Semaphore::new(cold_concurrency)),
+    };
     let app = Router::new()
         .route("/query", post(query_handler))
         .route("/health", axum::routing::get(|| async { "ok" }))
@@ -337,7 +368,16 @@ mod tests {
     use server::flush_events;
     use std::sync::atomic::Ordering;
     use std::collections::HashMap;
+    use storage::MinioConfig;
     use tower::util::ServiceExt;
+
+    fn make_state(manifest: Manifest) -> AppState {
+        AppState {
+            manifest: Arc::new(Mutex::new(manifest)),
+            minio: MinioConfig::default(),
+            cold_semaphore: Arc::new(Semaphore::new(4)),
+        }
+    }
 
     // Returns (data_rows, stats) from a query response.
     async fn query(state: AppState, req: QueryRequest) -> (Vec<serde_json::Value>, serde_json::Value) {
@@ -409,7 +449,7 @@ mod tests {
         assert_eq!(files[0].record_count, 1);
         assert_eq!(files[0].service, "test-svc");
 
-        let state = AppState { manifest: Arc::new(Mutex::new(manifest)) };
+        let state = make_state(manifest);
         let app = Router::new()
             .route("/query", post(query_handler))
             .with_state(state.clone());
@@ -503,7 +543,7 @@ mod tests {
     async fn missing_time_bounds_returns_400() {
         let dir = tempfile::tempdir().unwrap();
         let manifest = Manifest::open(&dir.path().join("manifest.db")).unwrap();
-        let state = AppState { manifest: Arc::new(Mutex::new(manifest)) };
+        let state = make_state(manifest);
 
         let app = Router::new()
             .route("/query", post(query_handler))
@@ -543,7 +583,7 @@ mod tests {
     async fn valid_time_bounds_returns_200() {
         let dir = tempfile::tempdir().unwrap();
         let manifest = Manifest::open(&dir.path().join("manifest.db")).unwrap();
-        let state = AppState { manifest: Arc::new(Mutex::new(manifest)) };
+        let state = make_state(manifest);
 
         let app = Router::new()
             .route("/query", post(query_handler))
@@ -603,7 +643,7 @@ mod tests {
             .map(|f| f.size_bytes as u64)
             .sum();
 
-        let state = AppState { manifest: Arc::new(Mutex::new(manifest)) };
+        let state = make_state(manifest);
         // SQL WHERE clause matches time_to so rows_scanned reflects only in-range rows.
         let (_, stats) = query(
             state,
@@ -655,7 +695,7 @@ mod tests {
         // File 2: contains only the duplicate (the replayed copy).
         flush_events(&[duplicate.clone()], &data_dir, &mut manifest).unwrap();
 
-        let state = AppState { manifest: Arc::new(Mutex::new(manifest)) };
+        let state = make_state(manifest);
         let (rows, stats) = query(
             state,
             QueryRequest {
@@ -703,7 +743,7 @@ mod tests {
         flush_events(&[event.clone()], &data_dir, &mut manifest).unwrap();
         flush_events(&[event.clone()], &data_dir, &mut manifest).unwrap();
 
-        let state = AppState { manifest: Arc::new(Mutex::new(manifest)) };
+        let state = make_state(manifest);
         // Projection omits kafka_partition and kafka_offset — dedup still fires
         // because it happens in the view before the user's projection.
         let (rows, stats) = query(
@@ -842,7 +882,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Query and assert all N events are present.
-        let state = AppState { manifest };
+        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)) };
         let rows = query_rows(state, QueryRequest {
             sql: "SELECT * FROM logs".to_string(),
             time_from: Some(0),
@@ -994,7 +1034,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // All N events must be present — none were permanently lost.
-        let state = AppState { manifest };
+        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)) };
         let rows = query_rows(state, QueryRequest {
             sql: "SELECT * FROM logs".to_string(),
             time_from: Some(0), time_to: Some(i64::MAX), limit: 1000,
@@ -1118,7 +1158,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // All N events must be present with no duplicates (unique by kafka_offset).
-        let state = AppState { manifest };
+        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)) };
         let rows = query_rows(
             state,
             QueryRequest {
@@ -1217,6 +1257,106 @@ mod tests {
         store.delete(&obj_path).await.unwrap();
     }
 
+    /// Ingest 4 events → tier 2 to MinIO → query spanning both tiers → assert all 4 returned.
+    /// Requires MinIO running: `make up`
+    /// Run with: cargo test -p server -- --ignored cross_tier
+    #[tokio::test]
+    #[ignore]
+    async fn cross_tier_query_returns_rows_from_both_tiers() {
+        use object_store::path::Path as ObjPath;
+        use server::{run_tiering, TieringConfig};
+        use storage::{minio_store, MinioConfig};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("manifest.db");
+        let data_dir = dir.path().join("data");
+        let mut manifest = Manifest::open(&db_path).unwrap();
+
+        // Flush 4 events into 4 separate files so tiering can move a known subset.
+        let make = |ts: i64, offset: i64| LogEvent {
+            timestamp: ts,
+            level: Level::Info,
+            service: "svc".to_string(),
+            message: "cross-tier test".to_string(),
+            kafka_partition: 0,
+            kafka_offset: offset,
+            attributes: HashMap::new(),
+        };
+        flush_events(&[make(1_000, 10)], &data_dir, &mut manifest).unwrap();
+        flush_events(&[make(2_000, 11)], &data_dir, &mut manifest).unwrap();
+        flush_events(&[make(3_000, 12)], &data_dir, &mut manifest).unwrap();
+        flush_events(&[make(4_000, 13)], &data_dir, &mut manifest).unwrap();
+        assert_eq!(manifest.active_files(None).unwrap().len(), 4);
+
+        // Tier all 4 files to MinIO (threshold_days=0 → all files eligible).
+        let manifest_arc = Arc::new(Mutex::new(manifest));
+        let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
+        let tiering_config = TieringConfig {
+            minio: MinioConfig::default(),
+            threshold_days: 0,
+            interval_secs: 0,
+        };
+        let tier_manifest = Arc::clone(&manifest_arc);
+        let handle = tokio::spawn(async move {
+            run_tiering(tiering_config, tier_manifest, shutdown_rx).await
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let _ = shutdown_tx.send(());
+        handle.await.unwrap().unwrap();
+
+        // Verify 2 files are cold; manually flip 2 back to hot so we have a mixed state.
+        {
+            let m = manifest_arc.lock().await;
+            let all = m.active_files(None).unwrap();
+            assert_eq!(all.len(), 4, "all 4 files must still be active after tiering");
+            let cold_count = all.iter().filter(|f| f.tier == "cold").count();
+            assert_eq!(cold_count, 4, "all 4 should have been tiered");
+
+            // Flip 2 files back to hot using the local path that no longer exists — instead
+            // we re-flush 2 fresh events so we have genuine local files for the hot tier.
+        }
+
+        // Re-flush 2 new hot events to create a genuine mixed state.
+        {
+            let mut m = manifest_arc.lock().await;
+            flush_events(&[make(5_000, 20)], &data_dir, &mut *m).unwrap();
+            flush_events(&[make(6_000, 21)], &data_dir, &mut *m).unwrap();
+        }
+
+        // 4 cold + 2 hot = 6 active files, 6 distinct events.
+        let state = AppState {
+            manifest: Arc::clone(&manifest_arc),
+            minio: MinioConfig::default(),
+            cold_semaphore: Arc::new(Semaphore::new(4)),
+        };
+        let (rows, _stats) = query(
+            state,
+            QueryRequest {
+                sql: "SELECT kafka_offset FROM logs ORDER BY kafka_offset".to_string(),
+                time_from: Some(0),
+                time_to: Some(i64::MAX),
+                limit: 100,
+            },
+        )
+        .await;
+
+        assert_eq!(rows.len(), 6, "expected 6 rows from both tiers, got {}", rows.len());
+
+        let offsets: Vec<i64> = rows.iter().map(|r| r["kafka_offset"].as_i64().unwrap()).collect();
+        assert_eq!(offsets, vec![10, 11, 12, 13, 20, 21], "rows must span both tiers in order");
+
+        // Cleanup cold objects from MinIO.
+        let minio_config = MinioConfig::default();
+        let store = minio_store(&minio_config).unwrap();
+        let cold_files = manifest_arc.lock().await.active_files(None).unwrap();
+        for f in cold_files.iter().filter(|f| f.tier == "cold") {
+            let key = f.path
+                .strip_prefix(&format!("s3://{}/", minio_config.bucket))
+                .unwrap();
+            store.delete(&ObjPath::from(key)).await.ok();
+        }
+    }
+
     /// Verify that buffer backpressure pauses and resumes the Kafka consumer without
     /// dropping events. Uses a tiny batch buffer (500 bytes) so that two events
     /// (~240 bytes each) push occupancy above the 0.8 high-water mark, triggering
@@ -1306,7 +1446,7 @@ mod tests {
             "expected at least one backpressure pause"
         );
 
-        let state = AppState { manifest };
+        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)) };
         let rows = query_rows(
             state,
             QueryRequest {
