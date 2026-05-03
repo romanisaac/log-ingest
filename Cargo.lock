@@ -3075,6 +3075,7 @@ dependencies = [
  "chrono",
  "datafusion",
  "event-schema",
+ "futures",
  "manifest",
  "metrics",
  "metrics-exporter-prometheus",

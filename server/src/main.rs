@@ -6,12 +6,23 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use arrow::array::{Array, BooleanArray, Int32Array, Int64Array, StringArray, StringViewArray};
 use arrow::datatypes::DataType;
-use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Json, Router};
+use axum::{
+    body::Body,
+    extract::State,
+    http::{header, StatusCode},
+    response::{IntoResponse, Response},
+    routing::post,
+    Json, Router,
+};
+use bytes::Bytes;
 use datafusion::prelude::*;
+use futures::StreamExt;
 use manifest::Manifest;
 use serde::Deserialize;
 use server::{run_consumer, ConsumerConfig};
 use tokio::sync::{broadcast, Mutex, Semaphore};
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 // ─── HTTP API ────────────────────────────────────────────────────────────────
 
@@ -34,7 +45,7 @@ struct AppState {
 async fn query_handler(
     State(state): State<AppState>,
     Json(req): Json<QueryRequest>,
-) -> impl IntoResponse {
+) -> Response {
     if req.time_from.is_none() || req.time_to.is_none() {
         return (
             StatusCode::BAD_REQUEST,
@@ -42,27 +53,35 @@ async fn query_handler(
                 "error": "time_from and time_to are required",
                 "code": "missing_time_predicate"
             })),
-        ).into_response();
+        )
+        .into_response();
     }
 
-    match run_query(state, req).await {
-        Ok(rows) => (StatusCode::OK, Json(rows)).into_response(),
+    match stream_query(state, req).await {
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": format!("{:#}", e) })),
         )
-            .into_response(),
+        .into_response(),
+        Ok(stream) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/x-ndjson")
+            .body(Body::from_stream(stream))
+            .unwrap(),
     }
 }
 
-async fn run_query(state: AppState, req: QueryRequest) -> Result<Vec<serde_json::Value>> {
+async fn stream_query(
+    state: AppState,
+    req: QueryRequest,
+) -> Result<impl futures::Stream<Item = Result<Bytes, BoxError>> + Send + 'static> {
     let files = {
         let guard = state.manifest.lock().await;
         guard.active_files(None)?
     };
 
     if files.is_empty() {
-        return Ok(vec![]);
+        return Ok(futures::stream::empty::<Result<Bytes, BoxError>>().boxed());
     }
 
     let ctx = SessionContext::new();
@@ -89,27 +108,42 @@ async fn run_query(state: AppState, req: QueryRequest) -> Result<Vec<serde_json:
         .context("materialize view creation")?;
 
     let final_sql = format!("{} LIMIT {}", req.sql.trim_end_matches(';'), req.limit);
-    let batches = ctx
+    let batch_stream = ctx
         .sql(&final_sql)
         .await
         .context("parse user sql")?
-        .collect()
+        .execute_stream()
         .await
         .context("execute query")?;
 
-    let mut rows: Vec<serde_json::Value> = Vec::new();
-    for batch in &batches {
-        let schema = batch.schema();
-        for row_idx in 0..batch.num_rows() {
-            let mut obj = serde_json::Map::new();
-            for col_idx in 0..batch.num_columns() {
-                let val = arrow_value_to_json(batch.column(col_idx), row_idx)?;
-                obj.insert(schema.field(col_idx).name().clone(), val);
+    let ndjson_stream = batch_stream.flat_map(|batch_result| {
+        match batch_result {
+            Err(e) => futures::stream::once(futures::future::ready(
+                Err::<Bytes, BoxError>(Box::new(e)),
+            ))
+            .boxed(),
+            Ok(batch) => {
+                let schema = batch.schema();
+                let lines: Vec<Result<Bytes, BoxError>> = (0..batch.num_rows())
+                    .map(|row_idx| {
+                        let mut obj = serde_json::Map::new();
+                        for col_idx in 0..batch.num_columns() {
+                            let val = arrow_value_to_json(batch.column(col_idx), row_idx)
+                                .unwrap_or(serde_json::Value::Null);
+                            obj.insert(schema.field(col_idx).name().clone(), val);
+                        }
+                        let mut line = serde_json::to_string(&serde_json::Value::Object(obj))
+                            .map_err(|e| Box::new(e) as BoxError)?;
+                        line.push('\n');
+                        Ok(Bytes::from(line))
+                    })
+                    .collect();
+                futures::stream::iter(lines).boxed()
             }
-            rows.push(serde_json::Value::Object(obj));
         }
-    }
-    Ok(rows)
+    });
+
+    Ok(ndjson_stream.boxed())
 }
 
 fn arrow_value_to_json(col: &dyn Array, row: usize) -> Result<serde_json::Value> {
@@ -219,6 +253,37 @@ mod tests {
     use std::collections::HashMap;
     use tower::util::ServiceExt;
 
+    async fn query_rows(state: AppState, req: QueryRequest) -> Vec<serde_json::Value> {
+        let app = Router::new()
+            .route("/query", post(query_handler))
+            .with_state(state);
+        let body = serde_json::json!({
+            "sql": req.sql,
+            "time_from": req.time_from,
+            "time_to": req.time_to,
+            "limit": req.limit
+        });
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/query")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        bytes
+            .split(|&b| b == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect()
+    }
+
     fn make_event() -> LogEvent {
         let mut attrs = HashMap::new();
         attrs.insert("request_id".to_string(), AttributeValue::String("test-req-1".to_string()));
@@ -252,13 +317,43 @@ mod tests {
         assert_eq!(files[0].service, "test-svc");
 
         let state = AppState { manifest: Arc::new(Mutex::new(manifest)) };
-        let req = QueryRequest {
-            sql: "SELECT * FROM logs".to_string(),
-            time_from: Some(0),
-            time_to: Some(i64::MAX),
-            limit: 100,
-        };
-        let rows = run_query(state, req).await.unwrap();
+        let app = Router::new()
+            .route("/query", post(query_handler))
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "sql": "SELECT * FROM logs",
+            "time_from": 0,
+            "time_to": i64::MAX,
+            "limit": 100
+        });
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/query")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/x-ndjson"
+        );
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rows: Vec<serde_json::Value> = bytes
+            .split(|&b| b == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
         assert_eq!(rows.len(), 1);
 
         let row = &rows[0];
@@ -493,13 +588,12 @@ mod tests {
 
         // Query and assert all N events are present.
         let state = AppState { manifest };
-        let req = QueryRequest {
+        let rows = query_rows(state, QueryRequest {
             sql: "SELECT * FROM logs".to_string(),
             time_from: Some(0),
             time_to: Some(i64::MAX),
             limit: 1000,
-        };
-        let rows = run_query(state, req).await.unwrap();
+        }).await;
         assert_eq!(rows.len(), N, "expected {N} events, got {}", rows.len());
     }
 
@@ -646,10 +740,10 @@ mod tests {
 
         // All N events must be present — none were permanently lost.
         let state = AppState { manifest };
-        let rows = run_query(state, QueryRequest {
+        let rows = query_rows(state, QueryRequest {
             sql: "SELECT * FROM logs".to_string(),
             time_from: Some(0), time_to: Some(i64::MAX), limit: 1000,
-        }).await.unwrap();
+        }).await;
         assert_eq!(rows.len(), N, "expected {N} events after re-consumption, got {}", rows.len());
     }
 
@@ -770,7 +864,7 @@ mod tests {
 
         // All N events must be present with no duplicates (unique by kafka_offset).
         let state = AppState { manifest };
-        let rows = run_query(
+        let rows = query_rows(
             state,
             QueryRequest {
                 sql: "SELECT kafka_offset FROM logs ORDER BY kafka_offset".to_string(),
@@ -779,8 +873,7 @@ mod tests {
                 limit: 1000,
             },
         )
-        .await
-        .unwrap();
+        .await;
 
         assert_eq!(
             rows.len(),
@@ -886,7 +979,7 @@ mod tests {
         );
 
         let state = AppState { manifest };
-        let rows = run_query(
+        let rows = query_rows(
             state,
             QueryRequest {
                 sql: "SELECT * FROM logs".to_string(),
@@ -895,8 +988,7 @@ mod tests {
                 limit: 1000,
             },
         )
-        .await
-        .unwrap();
+        .await;
         assert_eq!(
             rows.len(),
             N,
