@@ -9,6 +9,7 @@ use object_store::ObjectStore;
 pub use object_store;
 
 /// Configuration for a MinIO (S3-compatible) backend.
+#[derive(Clone)]
 pub struct MinioConfig {
     /// HTTP endpoint, e.g. "http://localhost:9000"
     pub endpoint: String,
