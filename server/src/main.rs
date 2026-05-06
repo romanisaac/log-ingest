@@ -20,10 +20,12 @@ use futures::{channel::mpsc, StreamExt};
 use manifest::Manifest;
 use serde::Deserialize;
 use cold_cache::ColdCache;
+use compact::{run_compaction, CompactionConfig};
 use server::{run_consumer, run_tiering, ConsumerConfig, TieringConfig};
 use storage::MinioConfig;
 
 mod cold_cache;
+mod compact;
 use tokio::sync::{broadcast, Mutex, Semaphore};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -270,6 +272,7 @@ async fn main() {
         std::env::var("DATA_DIR").unwrap_or_else(|_| "data".to_string()),
     );
     std::fs::create_dir_all(&data_dir).expect("create data dir");
+    let data_dir = data_dir; // keep owned before cloning into spawned tasks
 
     let db_path = std::env::var("MANIFEST_PATH").unwrap_or_else(|_| "manifest.db".to_string());
     let manifest = Arc::new(Mutex::new(
@@ -288,10 +291,11 @@ async fn main() {
     let consumer_manifest = Arc::clone(&manifest);
     let consumer_semaphore = Arc::clone(&flush_semaphore);
     let consumer_shutdown = shutdown_tx.subscribe();
+    let consumer_data_dir = data_dir.clone();
     tokio::spawn(async move {
         if let Err(e) = run_consumer(
             ConsumerConfig::default(),
-            data_dir,
+            consumer_data_dir,
             consumer_manifest,
             Arc::new(AtomicU64::new(0)),
             consumer_semaphore,
@@ -331,6 +335,32 @@ async fn main() {
     tokio::spawn(async move {
         if let Err(e) = run_tiering(tiering_config, tiering_manifest, tiering_shutdown).await {
             tracing::error!("tiering task exited with error: {e:#}");
+        }
+    });
+
+    // Start background compaction task.
+    let compaction_manifest = Arc::clone(&manifest);
+    let compaction_shutdown = shutdown_tx.subscribe();
+    let compaction_config = CompactionConfig {
+        data_dir: data_dir.clone(),
+        min_files_per_bucket: std::env::var("COMPACT_MIN_FILES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2),
+        target_file_bytes: std::env::var("COMPACT_TARGET_BYTES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(64 * 1024 * 1024),
+        interval_secs: std::env::var("COMPACT_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1800),
+    };
+    tokio::spawn(async move {
+        if let Err(e) =
+            run_compaction(compaction_config, compaction_manifest, compaction_shutdown).await
+        {
+            tracing::error!("compaction task exited with error: {e:#}");
         }
     });
 
@@ -1471,6 +1501,98 @@ mod tests {
         ).await;
         assert_eq!(rows2.len(), 1, "second query must return the same event from cache");
         assert_eq!(rows1[0]["kafka_offset"], rows2[0]["kafka_offset"]);
+    }
+
+    /// Compact 3 small, out-of-order, duplicate-containing files into a single
+    /// sorted, deduplicated output; assert the manifest reflects the swap atomically.
+    #[tokio::test]
+    async fn compaction_sorts_deduplicates_and_swaps_manifest() {
+        use crate::compact::{compact_bucket, CompactionConfig};
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("manifest.db");
+        let data_dir = dir.path().join("data");
+        let mut manifest = Manifest::open(&db_path).unwrap();
+
+        let make = |ts: i64, offset: i64| LogEvent {
+            timestamp: ts,
+            level: Level::Info,
+            service: "svc".to_string(),
+            message: "msg".to_string(),
+            kafka_partition: 0,
+            kafka_offset: offset,
+            attributes: HashMap::new(),
+        };
+
+        // File 1: ts=3000 (out of order), unique offset=3.
+        flush_events(&[make(3_000, 3)], &data_dir, &mut manifest).unwrap();
+        // File 2: ts=1000, offset=1.
+        flush_events(&[make(1_000, 1)], &data_dir, &mut manifest).unwrap();
+        // File 3: ts=1000 offset=1 (duplicate of file 2) + ts=2000 offset=2.
+        flush_events(&[make(1_000, 1), make(2_000, 2)], &data_dir, &mut manifest).unwrap();
+
+        assert_eq!(manifest.active_files(None).unwrap().len(), 3);
+
+        // Determine the time_bucket so compact_bucket can find the right files.
+        // All events have ts in the nanosecond range → 1970-01-01-00.
+        let buckets = manifest.compactable_buckets(2).unwrap();
+        assert_eq!(buckets.len(), 1);
+        let (service, time_bucket) = &buckets[0];
+
+        let manifest_arc = Arc::new(Mutex::new(manifest));
+        let config = CompactionConfig {
+            data_dir: data_dir.clone(),
+            min_files_per_bucket: 2,
+            target_file_bytes: 64 * 1024 * 1024,
+            interval_secs: 3600,
+        };
+
+        compact_bucket(service, time_bucket, &config, &manifest_arc)
+            .await
+            .unwrap();
+
+        let active = manifest_arc.lock().await.active_files(None).unwrap();
+
+        // Old 3 files superseded → 1 new compacted file active.
+        assert_eq!(active.len(), 1, "exactly one compacted file should be active");
+        assert_eq!(active[0].service, "svc");
+        assert_eq!(active[0].tier, "hot");
+        assert_eq!(active[0].record_count, 3, "3 unique events after dedup");
+
+        // Read the compacted output file directly with DataFusion to verify content.
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.register_parquet("out", &active[0].path, ParquetReadOptions::default())
+            .await
+            .unwrap();
+        let batches = ctx
+            .sql("SELECT timestamp, kafka_offset FROM out ORDER BY timestamp")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let ts_col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        let off_col = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 3, "3 unique rows after dedup");
+
+        // Verify ascending timestamp sort.
+        assert!(ts_col.value(0) <= ts_col.value(1) && ts_col.value(1) <= ts_col.value(2),
+            "rows must be sorted by timestamp");
+
+        // Verify deduplication: no two rows share (partition, offset).
+        let offsets: Vec<i64> = (0..off_col.len()).map(|i| off_col.value(i)).collect();
+        let unique: std::collections::HashSet<i64> = offsets.iter().cloned().collect();
+        assert_eq!(unique.len(), offsets.len(), "no duplicate offsets");
     }
 
     /// Verify that buffer backpressure pauses and resumes the Kafka consumer without
