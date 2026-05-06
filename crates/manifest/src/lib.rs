@@ -145,6 +145,86 @@ impl Manifest {
         Ok((hot, cold))
     }
 
+    /// Return (service, time_bucket) pairs that have at least `min_files` hot active files.
+    pub fn compactable_buckets(&self, min_files: usize) -> Result<Vec<(String, String)>> {
+        let min = min_files as i64;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT service, time_bucket FROM files
+                 WHERE state = 'active' AND tier = 'hot'
+                 GROUP BY service, time_bucket
+                 HAVING COUNT(*) >= ?1",
+            )
+            .context("prepare compactable_buckets")?;
+        let rows = stmt
+            .query_map(params![min], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .context("query compactable_buckets")?
+            .collect::<std::result::Result<_, _>>()
+            .context("collect rows")?;
+        Ok(rows)
+    }
+
+    /// Return all active hot files for a given (service, time_bucket).
+    pub fn active_hot_files_for_bucket(
+        &self,
+        service: &str,
+        time_bucket: &str,
+    ) -> Result<Vec<FileEntry>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, path, tier, service, time_bucket, min_ts, max_ts,
+                        size_bytes, record_count, state, min_kafka_offset, max_kafka_offset
+                 FROM files
+                 WHERE state = 'active' AND tier = 'hot'
+                   AND service = ?1 AND time_bucket = ?2",
+            )
+            .context("prepare active_hot_files_for_bucket")?;
+        let rows = stmt
+            .query_map(params![service, time_bucket], map_row)
+            .context("query active_hot_files_for_bucket")?
+            .collect::<std::result::Result<_, _>>()
+            .context("collect rows")?;
+        Ok(rows)
+    }
+
+    /// Atomic compaction swap: insert new compacted files and mark old files superseded.
+    /// No window where data is missing — old files remain active until commit.
+    pub fn swap_compacted(&mut self, old_ids: &[i64], new_files: &[FlushMeta]) -> Result<()> {
+        let tx = self.conn.transaction().context("begin compaction transaction")?;
+        for meta in new_files {
+            tx.execute(
+                "INSERT INTO files
+                    (path, service, time_bucket, min_ts, max_ts,
+                     size_bytes, record_count, min_kafka_offset, max_kafka_offset)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    meta.path,
+                    meta.service,
+                    meta.time_bucket,
+                    meta.min_ts,
+                    meta.max_ts,
+                    meta.size_bytes,
+                    meta.record_count,
+                    meta.min_kafka_offset,
+                    meta.max_kafka_offset,
+                ],
+            )
+            .context("insert compacted file")?;
+        }
+        for &id in old_ids {
+            tx.execute(
+                "UPDATE files SET state = 'superseded' WHERE id = ?1",
+                params![id],
+            )
+            .context("mark file superseded")?;
+        }
+        tx.commit().context("commit compaction swap")
+    }
+
     /// Return paths of all active files, optionally filtered by service.
     pub fn active_files(&self, service: Option<&str>) -> Result<Vec<FileEntry>> {
         let mut stmt = if let Some(svc) = service {
