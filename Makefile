@@ -1,7 +1,8 @@
 .PHONY: build test lint seed up down clean
 
 build:
-	cargo build
+	cd frontend && npm ci && npm run build
+	cargo build --release
 
 test:
 	cargo test
