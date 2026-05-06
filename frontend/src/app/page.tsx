@@ -96,6 +96,10 @@ function fmtDateShort(ts: number): string {
   return new Date(ts).toLocaleString(undefined, { dateStyle: 'short', timeStyle: 'short' });
 }
 
+function fmtLocal(datetimeLocal: string): string {
+  return datetimeLocal ? datetimeLocal.replace('T', ' ') : '—';
+}
+
 // ── Virtualized results table ─────────────────────────────────────────────────
 
 function ResultsTable({
@@ -476,7 +480,10 @@ export default function Home() {
                       onClick={() => applyHistory(entry)}
                     >
                       <p className="text-xs text-gray-200 font-mono truncate">{entry.sql}</p>
-                      <p className="text-xs text-gray-500 mt-0.5">{fmtDateShort(entry.ts)}</p>
+                      <p className="text-xs text-gray-400 mt-0.5">
+                        {fmtLocal(entry.from)} → {fmtLocal(entry.to)}
+                      </p>
+                      <p className="text-xs text-gray-600 mt-0.5">{fmtDateShort(entry.ts)}</p>
                     </li>
                   ))}
                 </ul>
