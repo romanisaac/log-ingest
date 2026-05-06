@@ -161,7 +161,9 @@ async fn stream_query(
         .await
         .context("materialize view creation")?;
 
-    let final_sql = format!("{} LIMIT {}", req.sql.trim_end_matches(';'), req.limit);
+    // Wrap the user query so the server-side cap applies even when the user includes their own LIMIT.
+    let inner = req.sql.trim_end_matches(';').trim();
+    let final_sql = format!("SELECT * FROM ({inner}) AS _q LIMIT {}", req.limit);
     let batch_stream = ctx
         .sql(&final_sql)
         .await
