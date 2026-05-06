@@ -91,16 +91,17 @@ async fn stream_query(
     let time_from = req.time_from.unwrap();
     let time_to = req.time_to.unwrap();
 
-    // Compute file-level stats from manifest metadata before touching DataFusion.
+    // Partition files into scan set (overlaps the requested window) and pruned set.
     let is_pruned = |f: &&manifest::FileEntry| f.max_ts < time_from || f.min_ts > time_to;
     let files_pruned = files.iter().filter(is_pruned).count() as u64;
-    let bytes_scanned: u64 = files.iter().filter(|f| !is_pruned(f)).map(|f| f.size_bytes as u64).sum();
-    // Pre-dedup row count: total records in all non-pruned files per manifest.
-    let rows_scanned: u64 = files.iter().filter(|f| !is_pruned(f)).map(|f| f.record_count as u64).sum();
+    let scan_files: Vec<&manifest::FileEntry> = files.iter().filter(|f| !is_pruned(f)).collect();
+    let bytes_scanned: u64 = scan_files.iter().map(|f| f.size_bytes as u64).sum();
+    // Pre-dedup row count across files that will actually be scanned.
+    let rows_scanned: u64 = scan_files.iter().map(|f| f.record_count as u64).sum();
 
-    if files.is_empty() {
+    if scan_files.is_empty() {
         return Ok(futures::stream::once(futures::future::ready(Ok(
-            make_stats_bytes(0, 0, 0, 0),
+            make_stats_bytes(0, files_pruned, 0, 0),
         )))
         .boxed());
     }
@@ -109,7 +110,7 @@ async fn stream_query(
 
     // Acquire a cold semaphore permit if any cold files are present.
     // The permit is held for the full query duration to cap concurrent cold-tier I/O.
-    let has_cold = files.iter().any(|f| f.tier == "cold");
+    let has_cold = scan_files.iter().any(|f| f.tier == "cold");
     let cold_permit = if has_cold {
         Some(
             Arc::clone(&state.cold_semaphore)
@@ -125,7 +126,7 @@ async fn stream_query(
     // LRU cache — a miss downloads from MinIO and writes to disk; a hit returns the
     // cached path immediately. Either way, DataFusion always reads a local file.
     let mut table_names: Vec<String> = Vec::new();
-    for (i, entry) in files.iter().enumerate() {
+    for (i, entry) in scan_files.iter().enumerate() {
         let tname = format!("_file_{i}");
         let path = if entry.tier == "cold" {
             let mut cache = state.cold_cache.lock().await;
