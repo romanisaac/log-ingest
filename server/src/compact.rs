@@ -195,8 +195,12 @@ fn write_chunk(
     let path = dir.join(format!("{}.parquet", Uuid::new_v4()));
 
     let file = std::fs::File::create(&path).context("create compaction output file")?;
+    // Explicitly enable page-level statistics so DataFusion can prune row groups using min/max.
+    let props = parquet::file::properties::WriterProperties::builder()
+        .set_statistics_enabled(parquet::file::properties::EnabledStatistics::Page)
+        .build();
     let mut writer =
-        ArrowWriter::try_new(file, schema, None).context("create ArrowWriter")?;
+        ArrowWriter::try_new(file, schema, Some(props)).context("create ArrowWriter")?;
     for batch in batches {
         writer.write(batch).context("write batch to compaction file")?;
     }
@@ -221,6 +225,55 @@ fn write_chunk(
         min_kafka_offset,
         max_kafka_offset,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    fn make_batch(n_rows: usize) -> RecordBatch {
+        let schema = std::sync::Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let arr = Int64Array::from_iter_values(0..n_rows as i64);
+        RecordBatch::try_new(schema, vec![std::sync::Arc::new(arr)]).unwrap()
+    }
+
+    #[test]
+    fn split_by_ipc_size_splits_when_target_exceeded() {
+        let batch = make_batch(100);
+        let single_size = ipc_size(&batch);
+        assert!(single_size > 0);
+
+        // target less than one batch → each batch must be its own chunk
+        let chunks = split_by_ipc_size(
+            vec![batch.clone(), batch.clone(), batch.clone()],
+            single_size - 1,
+        );
+        assert_eq!(chunks.len(), 3, "each batch should be its own chunk when target < single batch size");
+        for chunk in &chunks {
+            assert_eq!(chunk.len(), 1);
+        }
+    }
+
+    #[test]
+    fn split_by_ipc_size_no_split_when_target_large() {
+        let batch = make_batch(100);
+        let single_size = ipc_size(&batch);
+
+        // target larger than 3 batches combined → all in one chunk
+        let chunks = split_by_ipc_size(
+            vec![batch.clone(), batch.clone(), batch.clone()],
+            single_size * 10,
+        );
+        assert_eq!(chunks.len(), 1, "all batches should be in one chunk when target is large");
+        assert_eq!(chunks[0].len(), 3);
+    }
+
+    #[test]
+    fn split_by_ipc_size_empty_input() {
+        let chunks = split_by_ipc_size(vec![], 1024);
+        assert!(chunks.is_empty());
+    }
 }
 
 fn col_min_max_i64(batches: &[RecordBatch], column: &str) -> Result<(i64, i64)> {

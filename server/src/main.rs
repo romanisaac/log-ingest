@@ -1595,6 +1595,66 @@ mod tests {
         assert_eq!(unique.len(), offsets.len(), "no duplicate offsets");
     }
 
+    /// Compacted Parquet files must carry row-group statistics on the timestamp column so
+    /// DataFusion can prune row groups at query time without reading page data.
+    #[tokio::test]
+    async fn compacted_file_has_row_group_statistics() {
+        use crate::compact::{compact_bucket, CompactionConfig};
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("manifest.db");
+        let data_dir = dir.path().join("data");
+        let mut manifest = Manifest::open(&db_path).unwrap();
+
+        let make = |ts: i64, offset: i64| LogEvent {
+            timestamp: ts,
+            level: Level::Info,
+            service: "svc".to_string(),
+            message: "msg".to_string(),
+            kafka_partition: 0,
+            kafka_offset: offset,
+            attributes: HashMap::new(),
+        };
+
+        flush_events(&[make(1_000, 1)], &data_dir, &mut manifest).unwrap();
+        flush_events(&[make(2_000, 2)], &data_dir, &mut manifest).unwrap();
+
+        let buckets = manifest.compactable_buckets(2).unwrap();
+        assert_eq!(buckets.len(), 1);
+        let (service, time_bucket) = &buckets[0];
+
+        let manifest_arc = Arc::new(Mutex::new(manifest));
+        let config = CompactionConfig {
+            data_dir: data_dir.clone(),
+            min_files_per_bucket: 2,
+            target_file_bytes: 64 * 1024 * 1024,
+            interval_secs: 3600,
+        };
+        compact_bucket(service, time_bucket, &config, &manifest_arc)
+            .await
+            .unwrap();
+
+        let active = manifest_arc.lock().await.active_files(None).unwrap();
+        assert_eq!(active.len(), 1, "one compacted file expected");
+
+        let file = std::fs::File::open(&active[0].path).unwrap();
+        let reader = SerializedFileReader::new(file).unwrap();
+        let metadata = reader.metadata();
+        assert!(metadata.num_row_groups() > 0);
+
+        let file_schema = metadata.file_metadata().schema_descr();
+        let ts_col_idx = (0..file_schema.num_columns())
+            .find(|&i| file_schema.column(i).name() == "timestamp")
+            .expect("timestamp column must exist in compacted file");
+
+        let rg = metadata.row_group(0);
+        assert!(
+            rg.column(ts_col_idx).statistics().is_some(),
+            "timestamp column must carry row-group statistics for min/max pruning"
+        );
+    }
+
     /// Verify that buffer backpressure pauses and resumes the Kafka consumer without
     /// dropping events. Uses a tiny batch buffer (500 bytes) so that two events
     /// (~240 bytes each) push occupancy above the 0.8 high-water mark, triggering
