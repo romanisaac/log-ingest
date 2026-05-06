@@ -111,7 +111,7 @@ export default function Home() {
         <div className="shrink-0 rounded-lg border border-gray-800 overflow-hidden">
           <div className="h-44">
             <MonacoEditor
-              defaultLanguage="sql"
+              language="sql"
               value={sql}
               onChange={(v) => setSql(v ?? '')}
               theme="vs-dark"
