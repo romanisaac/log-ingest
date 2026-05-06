@@ -23,6 +23,7 @@ use cold_cache::ColdCache;
 use server::{run_consumer, run_tiering, ConsumerConfig, TieringConfig};
 use storage::MinioConfig;
 
+mod assets;
 mod cold_cache;
 use tokio::sync::{broadcast, Mutex, Semaphore};
 
@@ -361,7 +362,8 @@ async fn main() {
             let handle = prometheus_handle.clone();
             move || { let h = handle.clone(); async move { h.render() } }
         }))
-        .with_state(state);
+        .with_state(state)
+        .fallback(assets::handler);
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))

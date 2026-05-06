@@ -5,3 +5,9 @@ data/
 *.db
 *.db-wal
 *.db-shm
+
+# Frontend
+frontend/node_modules/
+frontend/.next/
+frontend/out/*
+!frontend/out/.gitkeep
