@@ -19,8 +19,11 @@ use datafusion::prelude::*;
 use futures::{channel::mpsc, StreamExt};
 use manifest::Manifest;
 use serde::Deserialize;
+use cold_cache::ColdCache;
 use server::{run_consumer, run_tiering, ConsumerConfig, TieringConfig};
 use storage::MinioConfig;
+
+mod cold_cache;
 use tokio::sync::{broadcast, Mutex, Semaphore};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -43,6 +46,7 @@ struct AppState {
     manifest: Arc<Mutex<Manifest>>,
     minio: MinioConfig,
     cold_semaphore: Arc<Semaphore>,
+    cold_cache: Arc<Mutex<ColdCache>>,
 }
 
 async fn query_handler(
@@ -102,15 +106,10 @@ async fn stream_query(
 
     let ctx = SessionContext::new();
 
-    // Register the MinIO object store once if any cold files are present so
-    // DataFusion can resolve s3:// URIs.  Acquire a cold semaphore permit that is
-    // held for the lifetime of the query to cap concurrent cold-tier I/O.
+    // Acquire a cold semaphore permit if any cold files are present.
+    // The permit is held for the full query duration to cap concurrent cold-tier I/O.
     let has_cold = files.iter().any(|f| f.tier == "cold");
     let cold_permit = if has_cold {
-        let store = storage::minio_store(&state.minio).context("build MinIO store")?;
-        let minio_url = url::Url::parse(&format!("s3://{}", state.minio.bucket))
-            .context("parse MinIO URL")?;
-        ctx.register_object_store(&minio_url, store);
         Some(
             Arc::clone(&state.cold_semaphore)
                 .acquire_owned()
@@ -121,10 +120,21 @@ async fn stream_query(
         None
     };
 
+    // Register each file with DataFusion. Cold files are resolved through the local
+    // LRU cache — a miss downloads from MinIO and writes to disk; a hit returns the
+    // cached path immediately. Either way, DataFusion always reads a local file.
     let mut table_names: Vec<String> = Vec::new();
     for (i, entry) in files.iter().enumerate() {
         let tname = format!("_file_{i}");
-        ctx.register_parquet(&tname, &entry.path, ParquetReadOptions::default())
+        let path = if entry.tier == "cold" {
+            let mut cache = state.cold_cache.lock().await;
+            let local = cache.get_or_fetch(&entry.path, &state.minio).await?;
+            drop(cache);
+            local.to_string_lossy().into_owned()
+        } else {
+            entry.path.clone()
+        };
+        ctx.register_parquet(&tname, &path, ParquetReadOptions::default())
             .await
             .with_context(|| format!("register parquet {}", entry.path))?;
         table_names.push(tname);
@@ -328,10 +338,21 @@ async fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(4usize);
+    let cold_cache_dir = PathBuf::from(
+        std::env::var("COLD_CACHE_DIR").unwrap_or_else(|_| "cold_cache".to_string()),
+    );
+    let cold_cache_max_bytes = std::env::var("COLD_CACHE_MAX_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10u64 * 1024 * 1024 * 1024); // 10 GB default
+    let cold_cache = Arc::new(Mutex::new(
+        ColdCache::new(cold_cache_dir, cold_cache_max_bytes).expect("create cold cache"),
+    ));
     let state = AppState {
         manifest,
         minio: minio_config,
         cold_semaphore: Arc::new(Semaphore::new(cold_concurrency)),
+        cold_cache,
     };
     let app = Router::new()
         .route("/query", post(query_handler))
@@ -376,6 +397,13 @@ mod tests {
             manifest: Arc::new(Mutex::new(manifest)),
             minio: MinioConfig::default(),
             cold_semaphore: Arc::new(Semaphore::new(4)),
+            cold_cache: Arc::new(Mutex::new(
+                ColdCache::new(
+                    std::env::temp_dir().join("log-ingest-test-cache"),
+                    10 * 1024 * 1024 * 1024,
+                )
+                .expect("create test cold cache"),
+            )),
         }
     }
 
@@ -882,7 +910,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Query and assert all N events are present.
-        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)) };
+        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)), cold_cache: Arc::new(Mutex::new(ColdCache::new(std::env::temp_dir().join("log-ingest-test-cache"), 10 * 1024 * 1024 * 1024).unwrap())) };
         let rows = query_rows(state, QueryRequest {
             sql: "SELECT * FROM logs".to_string(),
             time_from: Some(0),
@@ -1034,7 +1062,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // All N events must be present — none were permanently lost.
-        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)) };
+        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)), cold_cache: Arc::new(Mutex::new(ColdCache::new(std::env::temp_dir().join("log-ingest-test-cache"), 10 * 1024 * 1024 * 1024).unwrap())) };
         let rows = query_rows(state, QueryRequest {
             sql: "SELECT * FROM logs".to_string(),
             time_from: Some(0), time_to: Some(i64::MAX), limit: 1000,
@@ -1158,7 +1186,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // All N events must be present with no duplicates (unique by kafka_offset).
-        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)) };
+        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)), cold_cache: Arc::new(Mutex::new(ColdCache::new(std::env::temp_dir().join("log-ingest-test-cache"), 10 * 1024 * 1024 * 1024).unwrap())) };
         let rows = query_rows(
             state,
             QueryRequest {
@@ -1324,10 +1352,12 @@ mod tests {
         }
 
         // 4 cold + 2 hot = 6 active files, 6 distinct events.
+        let cache_dir = dir.path().join("cache");
         let state = AppState {
             manifest: Arc::clone(&manifest_arc),
             minio: MinioConfig::default(),
             cold_semaphore: Arc::new(Semaphore::new(4)),
+            cold_cache: Arc::new(Mutex::new(ColdCache::new(cache_dir, 10 * 1024 * 1024 * 1024).unwrap())),
         };
         let (rows, _stats) = query(
             state,
@@ -1355,6 +1385,92 @@ mod tests {
                 .unwrap();
             store.delete(&ObjPath::from(key)).await.ok();
         }
+    }
+
+    /// First access to a cold file downloads it from MinIO (cache miss); the second
+    /// access is served from the local cache even after the MinIO object is deleted,
+    /// proving that the cache shields subsequent queries from object store I/O.
+    /// Requires MinIO running: `make up`
+    /// Run with: cargo test -p server -- --ignored cold_cache
+    #[tokio::test]
+    #[ignore]
+    async fn cold_cache_serves_subsequent_reads_without_minio() {
+        use object_store::path::Path as ObjPath;
+        use server::{run_tiering, TieringConfig};
+        use storage::{minio_store, MinioConfig};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        let db_path = dir.path().join("manifest.db");
+        let data_dir = dir.path().join("data");
+        let mut manifest = Manifest::open(&db_path).unwrap();
+
+        flush_events(&[make_event()], &data_dir, &mut manifest).unwrap();
+
+        // Tier the hot file to MinIO.
+        let manifest_arc = Arc::new(Mutex::new(manifest));
+        let (tx, rx) = broadcast::channel::<()>(1);
+        let tier_manifest = Arc::clone(&manifest_arc);
+        let handle = tokio::spawn(async move {
+            run_tiering(
+                TieringConfig { minio: MinioConfig::default(), threshold_days: 0, interval_secs: 0 },
+                tier_manifest,
+                rx,
+            ).await
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let _ = tx.send(());
+        handle.await.unwrap().unwrap();
+
+        let files = manifest_arc.lock().await.active_files(None).unwrap();
+        assert_eq!(files[0].tier, "cold", "file must be cold before cache test");
+        let cold_uri = files[0].path.clone();
+
+        let state = AppState {
+            manifest: Arc::clone(&manifest_arc),
+            minio: MinioConfig::default(),
+            cold_semaphore: Arc::new(Semaphore::new(4)),
+            cold_cache: Arc::new(Mutex::new(
+                ColdCache::new(cache_dir.clone(), 10 * 1024 * 1024 * 1024).unwrap(),
+            )),
+        };
+
+        // First query — cache miss: file is downloaded from MinIO.
+        let (rows1, _) = query(
+            state.clone(),
+            QueryRequest {
+                sql: "SELECT kafka_offset FROM logs".to_string(),
+                time_from: Some(0),
+                time_to: Some(i64::MAX),
+                limit: 10,
+            },
+        ).await;
+        assert_eq!(rows1.len(), 1, "first query must return the event");
+
+        // Cache file must now exist on disk.
+        let cache_files: Vec<_> = std::fs::read_dir(&cache_dir).unwrap().collect();
+        assert_eq!(cache_files.len(), 1, "one file should be in the cache dir");
+
+        // Delete the object from MinIO so the second query cannot re-download it.
+        let minio_config = MinioConfig::default();
+        let store = minio_store(&minio_config).unwrap();
+        let key = cold_uri
+            .strip_prefix(&format!("s3://{}/", minio_config.bucket))
+            .unwrap();
+        store.delete(&ObjPath::from(key)).await.expect("delete from MinIO");
+
+        // Second query — cache hit: succeeds even though MinIO object is gone.
+        let (rows2, _) = query(
+            state,
+            QueryRequest {
+                sql: "SELECT kafka_offset FROM logs".to_string(),
+                time_from: Some(0),
+                time_to: Some(i64::MAX),
+                limit: 10,
+            },
+        ).await;
+        assert_eq!(rows2.len(), 1, "second query must return the same event from cache");
+        assert_eq!(rows1[0]["kafka_offset"], rows2[0]["kafka_offset"]);
     }
 
     /// Verify that buffer backpressure pauses and resumes the Kafka consumer without
@@ -1446,7 +1562,7 @@ mod tests {
             "expected at least one backpressure pause"
         );
 
-        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)) };
+        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)), cold_cache: Arc::new(Mutex::new(ColdCache::new(std::env::temp_dir().join("log-ingest-test-cache"), 10 * 1024 * 1024 * 1024).unwrap())) };
         let rows = query_rows(
             state,
             QueryRequest {
