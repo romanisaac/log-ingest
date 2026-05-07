@@ -344,6 +344,7 @@ async fn main() {
 
     // Start background compaction task.
     let compaction_manifest = Arc::clone(&manifest);
+    let compaction_semaphore = Arc::clone(&flush_semaphore);
     let compaction_shutdown = shutdown_tx.subscribe();
     let compaction_config = CompactionConfig {
         data_dir: data_dir.clone(),
@@ -359,10 +360,27 @@ async fn main() {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(1800),
+        small_file_threshold: std::env::var("COMPACT_SMALL_FILE_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10),
+        max_duplicate_ratio: std::env::var("COMPACT_MAX_DUPLICATE_RATIO")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.5),
+        threshold_check_secs: std::env::var("COMPACT_THRESHOLD_CHECK_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60),
     };
     tokio::spawn(async move {
-        if let Err(e) =
-            run_compaction(compaction_config, compaction_manifest, compaction_shutdown).await
+        if let Err(e) = run_compaction(
+            compaction_config,
+            compaction_manifest,
+            compaction_semaphore,
+            compaction_shutdown,
+        )
+        .await
         {
             tracing::error!("compaction task exited with error: {e:#}");
         }
@@ -1546,9 +1564,7 @@ mod tests {
         let manifest_arc = Arc::new(Mutex::new(manifest));
         let config = CompactionConfig {
             data_dir: data_dir.clone(),
-            min_files_per_bucket: 2,
-            target_file_bytes: 64 * 1024 * 1024,
-            interval_secs: 3600,
+            ..CompactionConfig::default()
         };
 
         compact_bucket(service, time_bucket, &config, &manifest_arc)
@@ -1632,9 +1648,7 @@ mod tests {
         let manifest_arc = Arc::new(Mutex::new(manifest));
         let config = CompactionConfig {
             data_dir: data_dir.clone(),
-            min_files_per_bucket: 2,
-            target_file_bytes: 64 * 1024 * 1024,
-            interval_secs: 3600,
+            ..CompactionConfig::default()
         };
         compact_bucket(service, time_bucket, &config, &manifest_arc)
             .await
@@ -1657,6 +1671,70 @@ mod tests {
         assert!(
             rg.column(ts_col_idx).statistics().is_some(),
             "timestamp column must carry row-group statistics for min/max pruning"
+        );
+    }
+
+    /// Ingest enough single-event files to exceed the small-file threshold, then run
+    /// the compaction scheduler with a short check interval and assert the file count
+    /// drops once the threshold trigger fires.
+    #[tokio::test]
+    async fn threshold_trigger_fires_when_small_file_count_exceeded() {
+        use crate::compact::{run_compaction, CompactionConfig};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("manifest.db");
+        let data_dir = dir.path().join("data");
+        let mut manifest = Manifest::open(&db_path).unwrap();
+
+        let make = |offset: i64| LogEvent {
+            timestamp: 1_000_000 + offset,
+            level: Level::Info,
+            service: "svc".to_string(),
+            message: "msg".to_string(),
+            kafka_partition: 0,
+            kafka_offset: offset,
+            attributes: HashMap::new(),
+        };
+
+        // Flush 5 single-event files — one per call produces one small file per call.
+        for i in 0..5 {
+            flush_events(&[make(i)], &data_dir, &mut manifest).unwrap();
+        }
+        assert_eq!(manifest.active_files(None).unwrap().len(), 5);
+
+        let manifest_arc = Arc::new(Mutex::new(manifest));
+        let semaphore = Arc::new(Semaphore::new(4));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+
+        let config = CompactionConfig {
+            data_dir: data_dir.clone(),
+            // High schedule threshold so only the threshold check can fire.
+            min_files_per_bucket: 100,
+            // Trigger when a bucket reaches 3 files.
+            small_file_threshold: 3,
+            // Disable duplicate-density trigger.
+            max_duplicate_ratio: 1.0,
+            // Check every second so the test completes quickly.
+            threshold_check_secs: 1,
+            interval_secs: 3600,
+            ..CompactionConfig::default()
+        };
+
+        let m = Arc::clone(&manifest_arc);
+        let s = Arc::clone(&semaphore);
+        tokio::spawn(async move {
+            let _ = run_compaction(config, m, s, shutdown_rx).await;
+        });
+
+        // Give the threshold check time to fire and compaction to complete.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let _ = shutdown_tx.send(());
+
+        let active = manifest_arc.lock().await.active_files(None).unwrap();
+        assert!(
+            active.len() < 5,
+            "threshold trigger should have compacted 5 small files; still {} active",
+            active.len()
         );
     }
 

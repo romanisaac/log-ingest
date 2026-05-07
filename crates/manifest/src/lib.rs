@@ -32,6 +32,17 @@ pub struct FlushMeta {
     pub max_kafka_offset: i64,
 }
 
+/// Per-bucket statistics for compaction threshold evaluation.
+pub struct BucketStats {
+    pub service: String,
+    pub time_bucket: String,
+    pub file_count: usize,
+    pub total_records: i64,
+    /// Estimated duplicate density in [0.0, 1.0].
+    /// 0.0 means no duplicates detected; 1.0 means all records are duplicates.
+    pub duplicate_density: f64,
+}
+
 /// SQLite-backed manifest catalog.
 pub struct Manifest {
     conn: Connection,
@@ -223,6 +234,54 @@ impl Manifest {
             .context("mark file superseded")?;
         }
         tx.commit().context("commit compaction swap")
+    }
+
+    /// Per-bucket statistics used to evaluate compaction thresholds.
+    pub fn hot_bucket_stats(&self) -> Result<Vec<BucketStats>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT service, time_bucket,
+                        COUNT(*) AS file_count,
+                        SUM(record_count) AS total_records,
+                        MAX(max_kafka_offset) - MIN(min_kafka_offset) + 1 AS offset_span
+                 FROM files
+                 WHERE state = 'active' AND tier = 'hot'
+                 GROUP BY service, time_bucket",
+            )
+            .context("prepare hot_bucket_stats")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .context("query hot_bucket_stats")?;
+        let mut result = Vec::new();
+        for row in rows {
+            let (service, time_bucket, file_count, total_records, offset_span) =
+                row.context("read bucket stats row")?;
+            // Proxy for duplicate density: records above the unique-offset span are
+            // likely duplicates. This underestimates with multiple Kafka partitions
+            // but is a cheap, index-free signal.
+            let duplicate_density = if total_records > 0 && offset_span > 0 {
+                ((total_records - offset_span).max(0) as f64) / total_records as f64
+            } else {
+                0.0
+            };
+            result.push(BucketStats {
+                service,
+                time_bucket,
+                file_count: file_count as usize,
+                total_records,
+                duplicate_density,
+            });
+        }
+        Ok(result)
     }
 
     /// Return paths of all active files, optionally filtered by service.

@@ -8,19 +8,23 @@ use arrow::record_batch::RecordBatch;
 use datafusion::prelude::*;
 use manifest::{FlushMeta, Manifest};
 use parquet::arrow::ArrowWriter;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, Mutex, Semaphore};
 use uuid::Uuid;
 
 pub struct CompactionConfig {
     pub data_dir: PathBuf,
-    /// Minimum number of hot active files per (service, time_bucket) to trigger compaction.
+    /// Minimum file count per (service, time_bucket) for the scheduled compaction pass.
     pub min_files_per_bucket: usize,
-    /// Target IPC byte size per output file used to decide when to split. Default: 64 MiB.
-    /// Parquet compression means the on-disk file is typically 30–60 % of this value,
-    /// landing in the 32–128 MiB target range for typical log schemas.
+    /// Target IPC byte size per output file. Default: 64 MiB.
     pub target_file_bytes: u64,
-    /// How often the compaction task wakes to scan for eligible buckets.
+    /// How often the scheduled compaction pass runs.
     pub interval_secs: u64,
+    /// Trigger compaction immediately when a bucket has at least this many files.
+    pub small_file_threshold: usize,
+    /// Trigger compaction immediately when estimated duplicate density reaches this ratio.
+    pub max_duplicate_ratio: f64,
+    /// How often the threshold check runs (should be much shorter than `interval_secs`).
+    pub threshold_check_secs: u64,
 }
 
 impl Default for CompactionConfig {
@@ -30,6 +34,9 @@ impl Default for CompactionConfig {
             min_files_per_bucket: 2,
             target_file_bytes: 64 * 1024 * 1024,
             interval_secs: 1800,
+            small_file_threshold: 10,
+            max_duplicate_ratio: 0.5,
+            threshold_check_secs: 60,
         }
     }
 }
@@ -37,24 +44,46 @@ impl Default for CompactionConfig {
 pub async fn run_compaction(
     config: CompactionConfig,
     manifest: Arc<Mutex<Manifest>>,
+    semaphore: Arc<Semaphore>,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<()> {
+    let mut threshold_tick =
+        tokio::time::interval(Duration::from_secs(config.threshold_check_secs));
+    let mut schedule_tick = tokio::time::interval(Duration::from_secs(config.interval_secs));
+    // Consume the immediate first tick so neither timer fires on startup.
+    threshold_tick.tick().await;
+    schedule_tick.tick().await;
+
     loop {
-        tokio::select! {
+        let buckets: Vec<(String, String)> = tokio::select! {
             biased;
             _ = shutdown.recv() => return Ok(()),
-            _ = tokio::time::sleep(Duration::from_secs(config.interval_secs)) => {}
-        }
-
-        let buckets = {
-            let m = manifest.lock().await;
-            m.compactable_buckets(config.min_files_per_bucket)?
+            _ = threshold_tick.tick() => {
+                let stats = manifest.lock().await.hot_bucket_stats()?;
+                stats.into_iter()
+                    .filter(|s| {
+                        s.file_count >= config.small_file_threshold
+                            || s.duplicate_density >= config.max_duplicate_ratio
+                    })
+                    .map(|s| (s.service, s.time_bucket))
+                    .collect()
+            },
+            _ = schedule_tick.tick() => {
+                manifest.lock().await.compactable_buckets(config.min_files_per_bucket)?
+            },
         };
 
         for (service, time_bucket) in buckets {
+            let permit = Arc::clone(&semaphore)
+                .acquire_owned()
+                .await
+                .context("acquire semaphore for compaction")?;
+            metrics::gauge!("files_compacting").increment(1.0);
             if let Err(e) = compact_bucket(&service, &time_bucket, &config, &manifest).await {
                 tracing::warn!(service = %service, bucket = %time_bucket, "compaction failed: {e:#}");
             }
+            metrics::gauge!("files_compacting").decrement(1.0);
+            drop(permit);
         }
     }
 }
