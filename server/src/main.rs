@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -86,6 +86,19 @@ struct AppState {
     job_timeout_secs: u64,
     job_semaphore: Arc<Semaphore>,
     per_client_queue_cap: usize,
+    consumer_ready: Arc<AtomicBool>,
+}
+
+async fn health_handler() -> impl IntoResponse {
+    StatusCode::OK
+}
+
+async fn ready_handler(State(state): State<AppState>) -> impl IntoResponse {
+    if state.consumer_ready.load(std::sync::atomic::Ordering::Acquire) {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
 }
 
 async fn query_handler(
@@ -213,6 +226,9 @@ async fn stream_query(
         .await
         .context("execute query")?;
 
+    metrics::gauge!("active_queries").increment(1.0);
+    metrics::counter!("bytes_scanned_total").increment(bytes_scanned);
+
     let (tx, rx) = mpsc::unbounded::<Result<Bytes, BoxError>>();
     let started_at = std::time::Instant::now();
 
@@ -225,6 +241,7 @@ async fn stream_query(
         while let Some(result) = stream.next().await {
             match result {
                 Err(e) => {
+                    metrics::gauge!("active_queries").decrement(1.0);
                     tx.unbounded_send(Err(Box::new(e) as BoxError)).ok();
                     return;
                 }
@@ -252,12 +269,14 @@ async fn stream_query(
             }
         }
 
-        let duration_ms = started_at.elapsed().as_millis() as u64;
+        let elapsed = started_at.elapsed();
+        metrics::histogram!("query_duration_seconds").record(elapsed.as_secs_f64());
+        metrics::gauge!("active_queries").decrement(1.0);
         tx.unbounded_send(Ok(make_stats_bytes(
             rows_scanned,
             files_pruned,
             bytes_scanned,
-            duration_ms,
+            elapsed.as_millis() as u64,
         )))
         .ok();
     });
@@ -355,6 +374,7 @@ async fn submit_job_handler(
             .filter(|e| matches!(e.state, JobState::Queued) && e.client_ip == client_ip)
             .count();
         if queued >= state.per_client_queue_cap {
+            metrics::counter!("rate_limit_rejected_total").increment(1);
             return (
                 StatusCode::TOO_MANY_REQUESTS,
                 [(header::RETRY_AFTER, "5")],
@@ -631,6 +651,20 @@ async fn main() {
         .install_recorder()
         .expect("failed to install Prometheus recorder");
 
+    metrics::describe_counter!("events_ingested_total", "Total log events written to Parquet.");
+    metrics::describe_histogram!("flush_duration_seconds", "Time to flush a partition batch to Parquet.");
+    metrics::describe_gauge!("buffer_occupancy_ratio", "Current fill ratio of each partition's batch buffer (0–1).");
+    metrics::describe_gauge!("kafka_consumer_lag", "Unconsumed messages between committed offset and high-watermark.");
+    metrics::describe_counter!("backpressure_pauses_total", "Times a Kafka partition was paused due to backpressure.");
+    metrics::describe_gauge!("files_active", "Number of active Parquet files by storage tier.");
+    metrics::describe_gauge!("files_compacting", "1 while a compaction run is in progress, 0 otherwise.");
+    metrics::describe_histogram!("query_duration_seconds", "End-to-end latency of streaming queries.");
+    metrics::describe_counter!("bytes_scanned_total", "Bytes of Parquet data scanned by queries.");
+    metrics::describe_gauge!("active_queries", "Number of queries currently streaming results.");
+    metrics::describe_counter!("rate_limit_rejected_total", "Job submissions rejected by the per-client queue cap.");
+    metrics::describe_counter!("cache_hits_total", "Cold-tier cache hits (file served from local disk).");
+    metrics::describe_counter!("cache_misses_total", "Cold-tier cache misses (file downloaded from MinIO).");
+
     let data_dir = PathBuf::from(
         std::env::var("DATA_DIR").unwrap_or_else(|_| "data".to_string()),
     );
@@ -651,10 +685,12 @@ async fn main() {
     let flush_semaphore = Arc::new(Semaphore::new(max_concurrent_flushes));
 
     // Start Kafka consumer as a background task.
+    let consumer_ready = Arc::new(AtomicBool::new(false));
     let consumer_manifest = Arc::clone(&manifest);
     let consumer_semaphore = Arc::clone(&flush_semaphore);
     let consumer_shutdown = shutdown_tx.subscribe();
     let consumer_data_dir = data_dir.clone();
+    let consumer_ready_bg = Arc::clone(&consumer_ready);
     tokio::spawn(async move {
         if let Err(e) = run_consumer(
             ConsumerConfig::default(),
@@ -662,6 +698,7 @@ async fn main() {
             consumer_manifest,
             Arc::new(AtomicU64::new(0)),
             consumer_semaphore,
+            consumer_ready_bg,
             consumer_shutdown,
         )
         .await
@@ -821,6 +858,7 @@ async fn main() {
         job_timeout_secs,
         job_semaphore: Arc::new(Semaphore::new(max_concurrent_jobs)),
         per_client_queue_cap,
+        consumer_ready,
     };
     let app = Router::new()
         .route("/ingest", post(ingest_handler))
@@ -828,7 +866,8 @@ async fn main() {
         .route("/jobs", post(submit_job_handler))
         .route("/jobs/:id", get(poll_job_handler).delete(delete_job_handler))
         .route("/jobs/:id/results", get(results_job_handler))
-        .route("/health", axum::routing::get(|| async { "ok" }))
+        .route("/health", axum::routing::get(health_handler))
+        .route("/ready", axum::routing::get(ready_handler))
         .route("/metrics", axum::routing::get({
             let handle = prometheus_handle.clone();
             move || { let h = handle.clone(); async move { h.render() } }
@@ -884,6 +923,7 @@ mod tests {
             job_timeout_secs: 300,
             job_semaphore: Arc::new(Semaphore::new(8)),
             per_client_queue_cap: 5,
+            consumer_ready: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -1379,6 +1419,7 @@ mod tests {
                 consumer_manifest,
                 Arc::new(AtomicU64::new(0)),
                 Arc::new(Semaphore::new(4)),
+                Arc::new(AtomicBool::new(false)),
                 shutdown_rx,
             )
             .await;
@@ -1390,7 +1431,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Query and assert all N events are present.
-        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)), cold_cache: Arc::new(Mutex::new(ColdCache::new(std::env::temp_dir().join("log-ingest-test-cache"), 10 * 1024 * 1024 * 1024).unwrap())), job_store: Arc::new(Mutex::new(HashMap::new())), jobs_dir: std::env::temp_dir().join("log-ingest-test-jobs"), job_timeout_secs: 300, job_semaphore: Arc::new(Semaphore::new(8)), per_client_queue_cap: 5 };
+        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)), cold_cache: Arc::new(Mutex::new(ColdCache::new(std::env::temp_dir().join("log-ingest-test-cache"), 10 * 1024 * 1024 * 1024).unwrap())), job_store: Arc::new(Mutex::new(HashMap::new())), jobs_dir: std::env::temp_dir().join("log-ingest-test-jobs"), job_timeout_secs: 300, job_semaphore: Arc::new(Semaphore::new(8)), per_client_queue_cap: 5, consumer_ready: Arc::new(AtomicBool::new(true)) };
         let rows = query_rows(state, QueryRequest {
             sql: "SELECT * FROM logs".to_string(),
             time_from: Some(0),
@@ -1447,7 +1488,7 @@ mod tests {
                 bootstrap_servers: "localhost:9092".to_string(),
                 group_id: gid, topic: top,
                 ..ConsumerConfig::default()
-            }, dd, m2, Arc::new(AtomicU64::new(0)), Arc::new(Semaphore::new(4)), rx).await;
+            }, dd, m2, Arc::new(AtomicU64::new(0)), Arc::new(Semaphore::new(4)), Arc::new(AtomicBool::new(false)), rx).await;
         });
         tokio::time::sleep(Duration::from_secs(3)).await;
         let _ = tx.send(());
@@ -1535,14 +1576,14 @@ mod tests {
                 bootstrap_servers: "localhost:9092".to_string(),
                 group_id: gid, topic: top,
                 ..ConsumerConfig::default()
-            }, dd, m2, Arc::new(AtomicU64::new(0)), Arc::new(Semaphore::new(4)), rx).await;
+            }, dd, m2, Arc::new(AtomicU64::new(0)), Arc::new(Semaphore::new(4)), Arc::new(AtomicBool::new(false)), rx).await;
         });
         tokio::time::sleep(Duration::from_secs(3)).await;
         let _ = tx.send(());
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // All N events must be present — none were permanently lost.
-        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)), cold_cache: Arc::new(Mutex::new(ColdCache::new(std::env::temp_dir().join("log-ingest-test-cache"), 10 * 1024 * 1024 * 1024).unwrap())), job_store: Arc::new(Mutex::new(HashMap::new())), jobs_dir: std::env::temp_dir().join("log-ingest-test-jobs"), job_timeout_secs: 300, job_semaphore: Arc::new(Semaphore::new(8)), per_client_queue_cap: 5 };
+        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)), cold_cache: Arc::new(Mutex::new(ColdCache::new(std::env::temp_dir().join("log-ingest-test-cache"), 10 * 1024 * 1024 * 1024).unwrap())), job_store: Arc::new(Mutex::new(HashMap::new())), jobs_dir: std::env::temp_dir().join("log-ingest-test-jobs"), job_timeout_secs: 300, job_semaphore: Arc::new(Semaphore::new(8)), per_client_queue_cap: 5, consumer_ready: Arc::new(AtomicBool::new(true)) };
         let rows = query_rows(state, QueryRequest {
             sql: "SELECT * FROM logs".to_string(),
             time_from: Some(0), time_to: Some(i64::MAX), limit: 1000,
@@ -1626,6 +1667,7 @@ mod tests {
                 m1,
                 Arc::new(AtomicU64::new(0)),
                 Arc::new(Semaphore::new(4)),
+                Arc::new(AtomicBool::new(false)),
                 rx1,
             )
             .await;
@@ -1654,6 +1696,7 @@ mod tests {
                 m2,
                 Arc::new(AtomicU64::new(0)),
                 Arc::new(Semaphore::new(4)),
+                Arc::new(AtomicBool::new(false)),
                 rx2,
             )
             .await;
@@ -1666,7 +1709,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // All N events must be present with no duplicates (unique by kafka_offset).
-        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)), cold_cache: Arc::new(Mutex::new(ColdCache::new(std::env::temp_dir().join("log-ingest-test-cache"), 10 * 1024 * 1024 * 1024).unwrap())), job_store: Arc::new(Mutex::new(HashMap::new())), jobs_dir: std::env::temp_dir().join("log-ingest-test-jobs"), job_timeout_secs: 300, job_semaphore: Arc::new(Semaphore::new(8)), per_client_queue_cap: 5 };
+        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)), cold_cache: Arc::new(Mutex::new(ColdCache::new(std::env::temp_dir().join("log-ingest-test-cache"), 10 * 1024 * 1024 * 1024).unwrap())), job_store: Arc::new(Mutex::new(HashMap::new())), jobs_dir: std::env::temp_dir().join("log-ingest-test-jobs"), job_timeout_secs: 300, job_semaphore: Arc::new(Semaphore::new(8)), per_client_queue_cap: 5, consumer_ready: Arc::new(AtomicBool::new(true)) };
         let rows = query_rows(
             state,
             QueryRequest {
@@ -1843,6 +1886,7 @@ mod tests {
             job_timeout_secs: 300,
             job_semaphore: Arc::new(Semaphore::new(8)),
             per_client_queue_cap: 5,
+            consumer_ready: Arc::new(AtomicBool::new(true)),
         };
         let (rows, _stats) = query(
             state,
@@ -1923,6 +1967,7 @@ mod tests {
             job_timeout_secs: 300,
             job_semaphore: Arc::new(Semaphore::new(8)),
             per_client_queue_cap: 5,
+            consumer_ready: Arc::new(AtomicBool::new(true)),
         };
 
         // First query — cache miss: file is downloaded from MinIO.
@@ -2268,6 +2313,7 @@ mod tests {
             job_timeout_secs: 60,
             job_semaphore: Arc::new(Semaphore::new(8)),
             per_client_queue_cap: 5,
+            consumer_ready: Arc::new(AtomicBool::new(true)),
         };
 
         let app = Router::new()
@@ -2422,6 +2468,7 @@ mod tests {
             job_timeout_secs: 60,
             job_semaphore: Arc::clone(&job_semaphore),
             per_client_queue_cap: 5,
+            consumer_ready: Arc::new(AtomicBool::new(true)),
         };
 
         let app = make_job_app(state);
@@ -2480,6 +2527,7 @@ mod tests {
             job_timeout_secs: 60,
             job_semaphore: Arc::new(Semaphore::new(8)),
             per_client_queue_cap: 5,
+            consumer_ready: Arc::new(AtomicBool::new(true)),
         };
 
         let app = make_job_app(state);
@@ -2532,6 +2580,7 @@ mod tests {
             job_timeout_secs: 60,
             job_semaphore: Arc::new(Semaphore::new(8)),
             per_client_queue_cap: 5,
+            consumer_ready: Arc::new(AtomicBool::new(true)),
         };
 
         let app = Router::new()
@@ -2612,6 +2661,7 @@ mod tests {
             job_timeout_secs: 60,
             job_semaphore: Arc::clone(&job_semaphore),
             per_client_queue_cap: 5,
+            consumer_ready: Arc::new(AtomicBool::new(true)),
         };
 
         let app = make_job_app(state);
@@ -2729,6 +2779,7 @@ mod tests {
                 m2,
                 pauses_clone,
                 Arc::new(Semaphore::new(4)),
+                Arc::new(AtomicBool::new(false)),
                 rx,
             )
             .await;
@@ -2745,7 +2796,7 @@ mod tests {
             "expected at least one backpressure pause"
         );
 
-        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)), cold_cache: Arc::new(Mutex::new(ColdCache::new(std::env::temp_dir().join("log-ingest-test-cache"), 10 * 1024 * 1024 * 1024).unwrap())), job_store: Arc::new(Mutex::new(HashMap::new())), jobs_dir: std::env::temp_dir().join("log-ingest-test-jobs"), job_timeout_secs: 300, job_semaphore: Arc::new(Semaphore::new(8)), per_client_queue_cap: 5 };
+        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)), cold_cache: Arc::new(Mutex::new(ColdCache::new(std::env::temp_dir().join("log-ingest-test-cache"), 10 * 1024 * 1024 * 1024).unwrap())), job_store: Arc::new(Mutex::new(HashMap::new())), jobs_dir: std::env::temp_dir().join("log-ingest-test-jobs"), job_timeout_secs: 300, job_semaphore: Arc::new(Semaphore::new(8)), per_client_queue_cap: 5, consumer_ready: Arc::new(AtomicBool::new(true)) };
         let rows = query_rows(
             state,
             QueryRequest {
@@ -2762,5 +2813,97 @@ mod tests {
             "expected {N} events after backpressure cycles, got {}",
             rows.len()
         );
+    }
+
+    #[tokio::test]
+    async fn metrics_report_events_and_queries() {
+        use axum::body::to_bytes;
+        use axum::http::Request;
+        use metrics_exporter_prometheus::PrometheusBuilder;
+        use std::sync::OnceLock;
+
+        static PROM: OnceLock<metrics_exporter_prometheus::PrometheusHandle> = OnceLock::new();
+        let prom_handle = PROM.get_or_init(|| {
+            PrometheusBuilder::new().install_recorder().unwrap()
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut manifest = Manifest::open(&tmp.path().join("manifest.db")).unwrap();
+
+        let event = event_schema::LogEvent {
+            service: "svc-metrics".into(),
+            timestamp: 1_700_000_000_000_000_000,
+            kafka_partition: 0,
+            kafka_offset: 1,
+            level: event_schema::Level::Info,
+            message: "metrics test".into(),
+            attributes: Default::default(),
+        };
+        flush_events(&[event], &data_dir, &mut manifest).unwrap();
+
+        let state = make_state(Manifest::open(&tmp.path().join("manifest.db")).unwrap());
+        // Re-open to get the flushed file registered; reuse the same db path.
+        let manifest2 = Arc::new(Mutex::new(
+            Manifest::open(&tmp.path().join("manifest.db")).unwrap(),
+        ));
+        let jobs_dir = tmp.path().join("jobs");
+        std::fs::create_dir_all(&jobs_dir).unwrap();
+        let state = AppState {
+            manifest: manifest2,
+            jobs_dir,
+            consumer_ready: Arc::new(AtomicBool::new(true)),
+            ..state
+        };
+
+        let h = prom_handle.clone();
+        let app = Router::new()
+            .route("/query", post(query_handler))
+            .route("/metrics", axum::routing::get(move || {
+                let h = h.clone();
+                async move { h.render() }
+            }))
+            .with_state(state);
+
+        // Run a query to populate query_duration_seconds.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/query")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"sql":"SELECT * FROM logs WHERE service='svc-metrics'","time_from":0,"time_to":9223372036854775807}"#,
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+
+        // Scrape /metrics.
+        let req = Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = std::str::from_utf8(&body).unwrap().to_owned();
+
+        // events_ingested_total must be non-zero (incremented by flush_events above).
+        let events_val: f64 = text
+            .lines()
+            .find(|l| l.starts_with("events_ingested_total{") && !l.starts_with('#'))
+            .and_then(|l| l.split_whitespace().last())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0);
+        assert!(events_val > 0.0, "events_ingested_total should be > 0, got {events_val}");
+
+        // query_duration_seconds_sum must be non-zero (incremented by the query above).
+        let qd_val: f64 = text
+            .lines()
+            .find(|l| l.starts_with("query_duration_seconds_sum") && !l.starts_with('#'))
+            .and_then(|l| l.split_whitespace().last())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0);
+        assert!(qd_val > 0.0, "query_duration_seconds_sum should be > 0, got {qd_val}");
     }
 }

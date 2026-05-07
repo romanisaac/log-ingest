@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -176,6 +176,7 @@ pub async fn run_consumer(
     manifest: Arc<Mutex<Manifest>>,
     backpressure_pauses: Arc<AtomicU64>,
     flush_semaphore: Arc<Semaphore>,
+    consumer_ready: Arc<AtomicBool>,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<()> {
     let (flush_tx, mut flush_rx) = mpsc::unbounded_channel::<FlushResult>();
@@ -200,7 +201,15 @@ pub async fn run_consumer(
         .create_with_context(ctx)?;
 
     consumer.subscribe(&[&config.topic])?;
-    tracing::info!("consumer subscribed to topic '{}'", config.topic);
+    // fetch_metadata actually connects to the broker; subscribe() alone is local-only.
+    // Only signal ready after confirming the broker is reachable.
+    match consumer.client().fetch_metadata(None, Duration::from_secs(10)) {
+        Ok(_) => {
+            consumer_ready.store(true, Ordering::Release);
+            tracing::info!("consumer subscribed to topic '{}' — broker reachable", config.topic);
+        }
+        Err(e) => tracing::warn!("consumer subscribed but broker not yet reachable: {e}"),
+    }
 
     let mut tick = interval(Duration::from_millis(100));
 
@@ -218,7 +227,7 @@ pub async fn run_consumer(
                                 event.kafka_partition = partition;
                                 event.kafka_offset = m.offset();
 
-                                let (batch, up_to_offset, pause_semaphore, pause_highwater) = {
+                                let (batch, up_to_offset, pause_semaphore, pause_highwater, occupancy) = {
                                     let mut s = store.lock().unwrap();
                                     s.pending.insert(partition, m.offset() + 1);
 
@@ -236,20 +245,25 @@ pub async fn run_consumer(
 
                                     let up_to_offset = s.pending[&partition];
                                     let is_paused = s.paused.contains(&partition);
+                                    let occ = s.buffers[&partition].occupancy();
 
                                     if batch.is_some() {
                                         // Flush triggered — pause if semaphore saturated.
                                         let sem = flush_semaphore.available_permits() == 0 && !is_paused;
                                         if sem { s.paused.insert(partition); }
-                                        (batch, up_to_offset, sem, false)
+                                        (batch, up_to_offset, sem, false, occ)
                                     } else {
                                         // No flush — check high-water mark.
-                                        let occ = s.buffers[&partition].occupancy();
                                         let hwm = !is_paused && occ > HIGH_WATER_MARK;
                                         if hwm { s.paused.insert(partition); }
-                                        (None, up_to_offset, false, hwm)
+                                        (None, up_to_offset, false, hwm, occ)
                                     }
                                 };
+
+                                metrics::gauge!(
+                                    "buffer_occupancy_ratio",
+                                    "partition" => partition.to_string()
+                                ).set(occupancy as f64);
 
                                 if pause_semaphore || pause_highwater {
                                     pause_partition(
@@ -312,6 +326,20 @@ pub async fn run_consumer(
                 // Age-triggered flush: check every partition buffer independently.
                 let partitions: Vec<i32> =
                     store.lock().unwrap().buffers.keys().copied().collect();
+                // Emit consumer lag per partition (high watermark - last committed offset).
+                for partition in &partitions {
+                    if let Ok((_, high)) = consumer.fetch_watermarks(
+                        &config.topic,
+                        *partition,
+                        Duration::from_millis(10),
+                    ) {
+                        let committed = store.lock().unwrap().committed.get(partition).copied().unwrap_or(0);
+                        metrics::gauge!(
+                            "kafka_consumer_lag",
+                            "partition" => partition.to_string()
+                        ).set((high - committed).max(0) as f64);
+                    }
+                }
                 for partition in partitions {
                     let batch_info = {
                         let mut s = store.lock().unwrap();
@@ -486,6 +514,10 @@ fn pause_partition<C: ConsumerContext>(
         tracing::error!("failed to pause partition {partition}: {e}");
     } else {
         let count = pauses_total.fetch_add(1, Ordering::Relaxed) + 1;
+        metrics::counter!(
+            "backpressure_pauses_total",
+            "partition" => partition.to_string()
+        ).increment(1);
         tracing::info!(
             "backpressure: paused partition {partition} (total pauses: {count})"
         );
