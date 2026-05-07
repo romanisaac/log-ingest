@@ -48,5 +48,12 @@ pub fn flush_events(events: &[LogEvent], data_dir: &Path, manifest: &mut Manifes
         })
         .context("commit flush")?;
 
+    metrics::counter!(
+        "events_ingested_total",
+        "service" => service.clone(),
+        "partition" => events[0].kafka_partition.to_string()
+    )
+    .increment(events.len() as u64);
+
     Ok(file_path)
 }
