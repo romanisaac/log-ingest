@@ -22,7 +22,7 @@ use manifest::Manifest;
 use serde::Deserialize;
 use cold_cache::ColdCache;
 use compact::{run_compaction, CompactionConfig};
-use server::{run_consumer, run_sweeper, run_tiering, ConsumerConfig, SweeperConfig, TieringConfig};
+use server::{flush_events, run_consumer, run_sweeper, run_tiering, ConsumerConfig, SweeperConfig, TieringConfig};
 use storage::MinioConfig;
 
 mod assets;
@@ -51,9 +51,28 @@ enum JobState {
     Running,
     Complete { result_count: usize, result_path: PathBuf },
     Failed { error: String },
+    Cancelled,
 }
 
-type JobStore = Arc<Mutex<HashMap<uuid::Uuid, JobState>>>;
+#[derive(Clone)]
+struct JobEntry {
+    state: JobState,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+type JobStore = Arc<Mutex<HashMap<uuid::Uuid, JobEntry>>>;
+
+#[derive(Debug, Deserialize)]
+struct IngestRequest {
+    service: String,
+    timestamp: i64,
+    kafka_partition: i32,
+    kafka_offset: i64,
+    level: String,
+    message: String,
+    #[serde(default)]
+    attributes: HashMap<String, event_schema::AttributeValue>,
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -64,6 +83,7 @@ struct AppState {
     job_store: JobStore,
     jobs_dir: PathBuf,
     job_timeout_secs: u64,
+    job_semaphore: Arc<Semaphore>,
 }
 
 async fn query_handler(
@@ -323,29 +343,55 @@ async fn submit_job_handler(
     }
 
     let job_id = uuid::Uuid::new_v4();
+    let cancel = tokio_util::sync::CancellationToken::new();
     {
-        state.job_store.lock().await.insert(job_id, JobState::Queued);
+        state.job_store.lock().await.insert(job_id, JobEntry {
+            state: JobState::Queued,
+            cancel: cancel.clone(),
+        });
     }
 
     let state_bg = state.clone();
     tokio::spawn(async move {
+        // Acquire a semaphore permit before running; this bounds concurrency and
+        // ensures the permit is released on completion, failure, timeout, or cancel.
+        let _permit = Arc::clone(&state_bg.job_semaphore)
+            .acquire_owned()
+            .await
+            .expect("job semaphore closed");
+
         {
-            state_bg.job_store.lock().await.insert(job_id, JobState::Running);
+            let mut store = state_bg.job_store.lock().await;
+            if let Some(entry) = store.get_mut(&job_id) {
+                entry.state = JobState::Running;
+            }
         }
 
         let timeout = Duration::from_secs(state_bg.job_timeout_secs);
-        let new_state = match tokio::time::timeout(timeout, run_job(state_bg.clone(), req, job_id)).await {
-            Err(_) => JobState::Failed {
-                error: format!("job timed out after {} seconds", state_bg.job_timeout_secs),
-            },
-            Ok(Err(e)) => JobState::Failed { error: format!("{e:#}") },
-            Ok(Ok(result_count)) => JobState::Complete {
-                result_count,
-                result_path: state_bg.jobs_dir.join(format!("{job_id}.ndjson")),
-            },
+        let new_state = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => JobState::Cancelled,
+            result = tokio::time::timeout(timeout, run_job(state_bg.clone(), req, job_id)) => {
+                match result {
+                    Err(_) => JobState::Failed {
+                        error: format!("job timed out after {} seconds", state_bg.job_timeout_secs),
+                    },
+                    Ok(Err(e)) => JobState::Failed { error: format!("{e:#}") },
+                    Ok(Ok(result_count)) => JobState::Complete {
+                        result_count,
+                        result_path: state_bg.jobs_dir.join(format!("{job_id}.ndjson")),
+                    },
+                }
+            }
         };
 
-        state_bg.job_store.lock().await.insert(job_id, new_state);
+        // Only write back if DELETE hasn't already set Cancelled.
+        let mut store = state_bg.job_store.lock().await;
+        if let Some(entry) = store.get_mut(&job_id) {
+            if !matches!(entry.state, JobState::Cancelled) {
+                entry.state = new_state;
+            }
+        }
     });
 
     (
@@ -355,20 +401,24 @@ async fn submit_job_handler(
     .into_response()
 }
 
+fn parse_job_id(id_str: &str) -> Option<uuid::Uuid> {
+    id_str.parse().ok()
+}
+
 async fn poll_job_handler(
     State(state): State<AppState>,
     AxumPath(id_str): AxumPath<String>,
 ) -> Response {
-    let job_id = match id_str.parse::<uuid::Uuid>() {
-        Ok(id) => id,
-        Err(_) => return (
+    let job_id = match parse_job_id(&id_str) {
+        Some(id) => id,
+        None => return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": "invalid job id" })),
         ).into_response(),
     };
-    let job_state = state.job_store.lock().await.get(&job_id).cloned();
+    let entry = state.job_store.lock().await.get(&job_id).cloned();
 
-    match job_state {
+    match entry.map(|e| e.state) {
         None => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": "job not found" })),
@@ -376,6 +426,7 @@ async fn poll_job_handler(
         .into_response(),
         Some(JobState::Queued) => Json(serde_json::json!({ "state": "queued" })).into_response(),
         Some(JobState::Running) => Json(serde_json::json!({ "state": "running" })).into_response(),
+        Some(JobState::Cancelled) => Json(serde_json::json!({ "state": "cancelled" })).into_response(),
         Some(JobState::Failed { error }) => {
             Json(serde_json::json!({ "state": "failed", "error": error })).into_response()
         }
@@ -395,6 +446,147 @@ async fn poll_job_handler(
             }))
             .into_response()
         }
+    }
+}
+
+async fn delete_job_handler(
+    State(state): State<AppState>,
+    AxumPath(id_str): AxumPath<String>,
+) -> Response {
+    let job_id = match parse_job_id(&id_str) {
+        Some(id) => id,
+        None => return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "invalid job id" })),
+        ).into_response(),
+    };
+
+    let mut store = state.job_store.lock().await;
+    match store.get_mut(&job_id) {
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "job not found" })),
+        )
+        .into_response(),
+        Some(entry) => match &entry.state {
+            JobState::Queued | JobState::Running => {
+                entry.cancel.cancel();
+                entry.state = JobState::Cancelled;
+                StatusCode::NO_CONTENT.into_response()
+            }
+            JobState::Complete { .. } => (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "job already complete" })),
+            )
+            .into_response(),
+            JobState::Failed { .. } => (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "job already failed" })),
+            )
+            .into_response(),
+            JobState::Cancelled => (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "job already cancelled" })),
+            )
+            .into_response(),
+        },
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ResultsQuery {
+    #[serde(default)]
+    page: usize,
+    #[serde(default = "default_page_size")]
+    page_size: usize,
+}
+
+fn default_page_size() -> usize { 100 }
+
+async fn results_job_handler(
+    State(state): State<AppState>,
+    AxumPath(id_str): AxumPath<String>,
+    axum::extract::Query(params): axum::extract::Query<ResultsQuery>,
+) -> Response {
+    let job_id = match parse_job_id(&id_str) {
+        Some(id) => id,
+        None => return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "invalid job id" })),
+        ).into_response(),
+    };
+
+    let entry = state.job_store.lock().await.get(&job_id).cloned();
+    let result_path = match entry.map(|e| e.state) {
+        None => return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "job not found" })),
+        )
+        .into_response(),
+        Some(JobState::Complete { result_path, .. }) => result_path,
+        Some(_) => return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "job results not yet available" })),
+        )
+        .into_response(),
+    };
+
+    let all_rows: Vec<serde_json::Value> = match tokio::fs::read_to_string(&result_path).await {
+        Err(_) => vec![],
+        Ok(content) => content
+            .lines()
+            .filter(|l| !l.is_empty())
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect(),
+    };
+
+    let total = all_rows.len();
+    let page_size = params.page_size.max(1);
+    let rows: Vec<serde_json::Value> = all_rows
+        .into_iter()
+        .skip(params.page * page_size)
+        .take(page_size)
+        .collect();
+
+    Json(serde_json::json!({
+        "page": params.page,
+        "page_size": page_size,
+        "total": total,
+        "rows": rows,
+    }))
+    .into_response()
+}
+
+async fn ingest_handler(
+    State(state): State<AppState>,
+    Json(req): Json<IngestRequest>,
+) -> Response {
+    let level = match event_schema::Level::from_str(&req.level.to_uppercase()) {
+        Ok(l) => l,
+        Err(_) => return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("unknown level '{}'", req.level)})),
+        ).into_response(),
+    };
+    let event = event_schema::LogEvent {
+        service: req.service,
+        timestamp: req.timestamp,
+        kafka_partition: req.kafka_partition,
+        kafka_offset: req.kafka_offset,
+        level,
+        message: req.message,
+        attributes: req.attributes,
+    };
+    let data_dir = PathBuf::from(
+        std::env::var("DATA_DIR").unwrap_or_else(|_| "data".to_string()),
+    );
+    let mut m = state.manifest.lock().await;
+    match flush_events(&[event], &data_dir, &mut m) {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("{e:#}")})),
+        ).into_response(),
     }
 }
 
@@ -583,6 +775,11 @@ async fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(300u64);
 
+    let max_concurrent_jobs = std::env::var("MAX_CONCURRENT_JOBS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8usize);
+
     let state = AppState {
         manifest,
         minio: minio_config,
@@ -591,11 +788,14 @@ async fn main() {
         job_store: Arc::new(Mutex::new(HashMap::new())),
         jobs_dir,
         job_timeout_secs,
+        job_semaphore: Arc::new(Semaphore::new(max_concurrent_jobs)),
     };
     let app = Router::new()
+        .route("/ingest", post(ingest_handler))
         .route("/query", post(query_handler))
         .route("/jobs", post(submit_job_handler))
-        .route("/jobs/:id", get(poll_job_handler))
+        .route("/jobs/:id", get(poll_job_handler).delete(delete_job_handler))
+        .route("/jobs/:id/results", get(results_job_handler))
         .route("/health", axum::routing::get(|| async { "ok" }))
         .route("/metrics", axum::routing::get({
             let handle = prometheus_handle.clone();
@@ -650,6 +850,7 @@ mod tests {
             job_store: Arc::new(Mutex::new(HashMap::new())),
             jobs_dir,
             job_timeout_secs: 300,
+            job_semaphore: Arc::new(Semaphore::new(8)),
         }
     }
 
@@ -1156,7 +1357,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Query and assert all N events are present.
-        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)), cold_cache: Arc::new(Mutex::new(ColdCache::new(std::env::temp_dir().join("log-ingest-test-cache"), 10 * 1024 * 1024 * 1024).unwrap())), job_store: Arc::new(Mutex::new(HashMap::new())), jobs_dir: std::env::temp_dir().join("log-ingest-test-jobs"), job_timeout_secs: 300 };
+        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)), cold_cache: Arc::new(Mutex::new(ColdCache::new(std::env::temp_dir().join("log-ingest-test-cache"), 10 * 1024 * 1024 * 1024).unwrap())), job_store: Arc::new(Mutex::new(HashMap::new())), jobs_dir: std::env::temp_dir().join("log-ingest-test-jobs"), job_timeout_secs: 300, job_semaphore: Arc::new(Semaphore::new(8)) };
         let rows = query_rows(state, QueryRequest {
             sql: "SELECT * FROM logs".to_string(),
             time_from: Some(0),
@@ -1308,7 +1509,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // All N events must be present — none were permanently lost.
-        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)), cold_cache: Arc::new(Mutex::new(ColdCache::new(std::env::temp_dir().join("log-ingest-test-cache"), 10 * 1024 * 1024 * 1024).unwrap())), job_store: Arc::new(Mutex::new(HashMap::new())), jobs_dir: std::env::temp_dir().join("log-ingest-test-jobs"), job_timeout_secs: 300 };
+        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)), cold_cache: Arc::new(Mutex::new(ColdCache::new(std::env::temp_dir().join("log-ingest-test-cache"), 10 * 1024 * 1024 * 1024).unwrap())), job_store: Arc::new(Mutex::new(HashMap::new())), jobs_dir: std::env::temp_dir().join("log-ingest-test-jobs"), job_timeout_secs: 300, job_semaphore: Arc::new(Semaphore::new(8)) };
         let rows = query_rows(state, QueryRequest {
             sql: "SELECT * FROM logs".to_string(),
             time_from: Some(0), time_to: Some(i64::MAX), limit: 1000,
@@ -1432,7 +1633,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // All N events must be present with no duplicates (unique by kafka_offset).
-        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)), cold_cache: Arc::new(Mutex::new(ColdCache::new(std::env::temp_dir().join("log-ingest-test-cache"), 10 * 1024 * 1024 * 1024).unwrap())), job_store: Arc::new(Mutex::new(HashMap::new())), jobs_dir: std::env::temp_dir().join("log-ingest-test-jobs"), job_timeout_secs: 300 };
+        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)), cold_cache: Arc::new(Mutex::new(ColdCache::new(std::env::temp_dir().join("log-ingest-test-cache"), 10 * 1024 * 1024 * 1024).unwrap())), job_store: Arc::new(Mutex::new(HashMap::new())), jobs_dir: std::env::temp_dir().join("log-ingest-test-jobs"), job_timeout_secs: 300, job_semaphore: Arc::new(Semaphore::new(8)) };
         let rows = query_rows(
             state,
             QueryRequest {
@@ -1607,6 +1808,7 @@ mod tests {
             job_store: Arc::new(Mutex::new(HashMap::new())),
             jobs_dir: std::env::temp_dir().join("log-ingest-test-jobs"),
             job_timeout_secs: 300,
+            job_semaphore: Arc::new(Semaphore::new(8)),
         };
         let (rows, _stats) = query(
             state,
@@ -1685,6 +1887,7 @@ mod tests {
             job_store: Arc::new(Mutex::new(HashMap::new())),
             jobs_dir: std::env::temp_dir().join("log-ingest-test-jobs"),
             job_timeout_secs: 300,
+            job_semaphore: Arc::new(Semaphore::new(8)),
         };
 
         // First query — cache miss: file is downloaded from MinIO.
@@ -2028,12 +2231,14 @@ mod tests {
             job_store: Arc::new(Mutex::new(HashMap::new())),
             jobs_dir,
             job_timeout_secs: 60,
+            job_semaphore: Arc::new(Semaphore::new(8)),
         };
 
         let app = Router::new()
             .route("/query", post(query_handler))
             .route("/jobs", post(submit_job_handler))
-            .route("/jobs/:id", get(poll_job_handler))
+            .route("/jobs/:id", get(poll_job_handler).delete(delete_job_handler))
+            .route("/jobs/:id/results", get(results_job_handler))
             .with_state(state);
 
         let query_body = serde_json::json!({
@@ -2107,6 +2312,244 @@ mod tests {
         for (job_row, direct_row) in job_rows.iter().zip(direct_rows.iter()) {
             assert_eq!(job_row["kafka_offset"], direct_row["kafka_offset"]);
         }
+    }
+
+    // Hold all permits on the job semaphore so submitted jobs stay Queued.
+    // Returns the permits; drop them to unblock.
+    async fn exhaust_semaphore(sem: &Arc<Semaphore>, n: usize) -> Vec<tokio::sync::OwnedSemaphorePermit> {
+        let mut permits = Vec::with_capacity(n);
+        for _ in 0..n {
+            permits.push(Arc::clone(sem).acquire_owned().await.unwrap());
+        }
+        permits
+    }
+
+    fn make_job_app(state: AppState) -> axum::Router {
+        Router::new()
+            .route("/jobs", post(submit_job_handler))
+            .route("/jobs/:id", get(poll_job_handler).delete(delete_job_handler))
+            .route("/jobs/:id/results", get(results_job_handler))
+            .with_state(state)
+    }
+
+    async fn submit_job(app: &axum::Router, body: &serde_json::Value) -> String {
+        let bytes = axum::body::to_bytes(
+            app.clone().oneshot(
+                axum::http::Request::builder()
+                    .method("POST").uri("/jobs")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            ).await.unwrap().into_body(),
+            usize::MAX,
+        ).await.unwrap();
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+            ["job_id"].as_str().unwrap().to_string()
+    }
+
+    async fn get_job(app: &axum::Router, job_id: &str) -> (StatusCode, serde_json::Value) {
+        let resp = app.clone().oneshot(
+            axum::http::Request::builder()
+                .method("GET").uri(format!("/jobs/{job_id}"))
+                .body(axum::body::Body::empty()).unwrap(),
+        ).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    async fn delete_job(app: &axum::Router, job_id: &str) -> StatusCode {
+        app.clone().oneshot(
+            axum::http::Request::builder()
+                .method("DELETE").uri(format!("/jobs/{job_id}"))
+                .body(axum::body::Body::empty()).unwrap(),
+        ).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn cancel_queued_job_transitions_to_cancelled_and_releases_semaphore() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs_dir = dir.path().join("jobs");
+        std::fs::create_dir_all(&jobs_dir).unwrap();
+        let manifest = Manifest::open(&dir.path().join("manifest.db")).unwrap();
+
+        let job_semaphore = Arc::new(Semaphore::new(1));
+        let state = AppState {
+            manifest: Arc::new(Mutex::new(manifest)),
+            minio: MinioConfig::default(),
+            cold_semaphore: Arc::new(Semaphore::new(4)),
+            cold_cache: Arc::new(Mutex::new(
+                ColdCache::new(dir.path().join("cache"), 10 * 1024 * 1024 * 1024).unwrap(),
+            )),
+            job_store: Arc::new(Mutex::new(HashMap::new())),
+            jobs_dir,
+            job_timeout_secs: 60,
+            job_semaphore: Arc::clone(&job_semaphore),
+        };
+
+        let app = make_job_app(state);
+
+        // Hold the only semaphore permit so any submitted job stays Queued.
+        let _held = exhaust_semaphore(&job_semaphore, 1).await;
+
+        let body = serde_json::json!({
+            "sql": "SELECT 1", "time_from": 0, "time_to": i64::MAX, "limit": 1
+        });
+        let job_id = submit_job(&app, &body).await;
+
+        // Job must be Queued (semaphore exhausted).
+        let (_, poll) = get_job(&app, &job_id).await;
+        assert_eq!(poll["state"], "queued", "job should be queued while semaphore is held");
+
+        // Cancel it.
+        let status = delete_job(&app, &job_id).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (_, poll) = get_job(&app, &job_id).await;
+        assert_eq!(poll["state"], "cancelled");
+
+        // Release the held permit — the cancelled job must NOT grab it and run.
+        drop(_held);
+        tokio::task::yield_now().await;
+
+        // Semaphore permit must be available again (job never acquired it).
+        assert_eq!(job_semaphore.available_permits(), 1, "semaphore permit should be free");
+    }
+
+    #[tokio::test]
+    async fn delete_complete_job_returns_409() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("manifest.db");
+        let data_dir = dir.path().join("data");
+        let jobs_dir = dir.path().join("jobs");
+        std::fs::create_dir_all(&jobs_dir).unwrap();
+
+        let mut manifest = Manifest::open(&db_path).unwrap();
+        flush_events(&[LogEvent {
+            timestamp: 1_000, level: Level::Info, service: "svc".to_string(),
+            message: "msg".to_string(), kafka_partition: 0, kafka_offset: 0,
+            attributes: HashMap::new(),
+        }], &data_dir, &mut manifest).unwrap();
+
+        let state = AppState {
+            manifest: Arc::new(Mutex::new(manifest)),
+            minio: MinioConfig::default(),
+            cold_semaphore: Arc::new(Semaphore::new(4)),
+            cold_cache: Arc::new(Mutex::new(
+                ColdCache::new(dir.path().join("cache"), 10 * 1024 * 1024 * 1024).unwrap(),
+            )),
+            job_store: Arc::new(Mutex::new(HashMap::new())),
+            jobs_dir,
+            job_timeout_secs: 60,
+            job_semaphore: Arc::new(Semaphore::new(8)),
+        };
+
+        let app = make_job_app(state);
+        let body = serde_json::json!({
+            "sql": "SELECT * FROM logs", "time_from": 0, "time_to": i64::MAX, "limit": 10
+        });
+
+        let job_id = submit_job(&app, &body).await;
+
+        // Poll until complete.
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let (_, poll) = get_job(&app, &job_id).await;
+            if poll["state"] == "complete" { break; }
+        }
+        let (_, poll) = get_job(&app, &job_id).await;
+        assert_eq!(poll["state"], "complete", "job should be complete before testing 409");
+
+        let status = delete_job(&app, &job_id).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn results_endpoint_paginates_correctly() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("manifest.db");
+        let data_dir = dir.path().join("data");
+        let jobs_dir = dir.path().join("jobs");
+        std::fs::create_dir_all(&jobs_dir).unwrap();
+
+        let mut manifest = Manifest::open(&db_path).unwrap();
+        // Flush 5 events so we can paginate with page_size=2.
+        for i in 0..5i64 {
+            flush_events(&[LogEvent {
+                timestamp: 1_000 + i, level: Level::Info, service: "svc".to_string(),
+                message: "msg".to_string(), kafka_partition: 0, kafka_offset: i,
+                attributes: HashMap::new(),
+            }], &data_dir, &mut manifest).unwrap();
+        }
+
+        let state = AppState {
+            manifest: Arc::new(Mutex::new(manifest)),
+            minio: MinioConfig::default(),
+            cold_semaphore: Arc::new(Semaphore::new(4)),
+            cold_cache: Arc::new(Mutex::new(
+                ColdCache::new(dir.path().join("cache"), 10 * 1024 * 1024 * 1024).unwrap(),
+            )),
+            job_store: Arc::new(Mutex::new(HashMap::new())),
+            jobs_dir,
+            job_timeout_secs: 60,
+            job_semaphore: Arc::new(Semaphore::new(8)),
+        };
+
+        let app = Router::new()
+            .route("/jobs", post(submit_job_handler))
+            .route("/jobs/:id", get(poll_job_handler).delete(delete_job_handler))
+            .route("/jobs/:id/results", get(results_job_handler))
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "sql": "SELECT kafka_offset FROM logs ORDER BY kafka_offset",
+            "time_from": 0, "time_to": i64::MAX, "limit": 100
+        });
+        let job_id = submit_job(&app, &body).await;
+
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let (_, poll) = get_job(&app, &job_id).await;
+            if poll["state"] == "complete" { break; }
+        }
+
+        // Page 0: rows 0-1
+        let resp = axum::body::to_bytes(
+            app.clone().oneshot(
+                axum::http::Request::builder()
+                    .method("GET").uri(format!("/jobs/{job_id}/results?page=0&page_size=2"))
+                    .body(axum::body::Body::empty()).unwrap(),
+            ).await.unwrap().into_body(), usize::MAX,
+        ).await.unwrap();
+        let page0: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+        assert_eq!(page0["total"], 5);
+        assert_eq!(page0["page"], 0);
+        assert_eq!(page0["rows"].as_array().unwrap().len(), 2);
+        assert_eq!(page0["rows"][0]["kafka_offset"], 0);
+
+        // Page 1: rows 2-3
+        let resp = axum::body::to_bytes(
+            app.clone().oneshot(
+                axum::http::Request::builder()
+                    .method("GET").uri(format!("/jobs/{job_id}/results?page=1&page_size=2"))
+                    .body(axum::body::Body::empty()).unwrap(),
+            ).await.unwrap().into_body(), usize::MAX,
+        ).await.unwrap();
+        let page1: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+        assert_eq!(page1["rows"].as_array().unwrap().len(), 2);
+        assert_eq!(page1["rows"][0]["kafka_offset"], 2);
+
+        // Page 2: row 4 only (last page, partial)
+        let resp = axum::body::to_bytes(
+            app.clone().oneshot(
+                axum::http::Request::builder()
+                    .method("GET").uri(format!("/jobs/{job_id}/results?page=2&page_size=2"))
+                    .body(axum::body::Body::empty()).unwrap(),
+            ).await.unwrap().into_body(), usize::MAX,
+        ).await.unwrap();
+        let page2: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+        assert_eq!(page2["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(page2["rows"][0]["kafka_offset"], 4);
     }
 
     /// Verify that buffer backpressure pauses and resumes the Kafka consumer without
@@ -2198,7 +2641,7 @@ mod tests {
             "expected at least one backpressure pause"
         );
 
-        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)), cold_cache: Arc::new(Mutex::new(ColdCache::new(std::env::temp_dir().join("log-ingest-test-cache"), 10 * 1024 * 1024 * 1024).unwrap())), job_store: Arc::new(Mutex::new(HashMap::new())), jobs_dir: std::env::temp_dir().join("log-ingest-test-jobs"), job_timeout_secs: 300 };
+        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)), cold_cache: Arc::new(Mutex::new(ColdCache::new(std::env::temp_dir().join("log-ingest-test-cache"), 10 * 1024 * 1024 * 1024).unwrap())), job_store: Arc::new(Mutex::new(HashMap::new())), jobs_dir: std::env::temp_dir().join("log-ingest-test-jobs"), job_timeout_secs: 300, job_semaphore: Arc::new(Semaphore::new(8)) };
         let rows = query_rows(
             state,
             QueryRequest {
