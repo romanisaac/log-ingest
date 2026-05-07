@@ -21,7 +21,7 @@ use manifest::Manifest;
 use serde::Deserialize;
 use cold_cache::ColdCache;
 use compact::{run_compaction, CompactionConfig};
-use server::{run_consumer, run_tiering, ConsumerConfig, TieringConfig};
+use server::{run_consumer, run_sweeper, run_tiering, ConsumerConfig, SweeperConfig, TieringConfig};
 use storage::MinioConfig;
 
 mod assets;
@@ -385,6 +385,38 @@ async fn main() {
         .await
         {
             tracing::error!("compaction task exited with error: {e:#}");
+        }
+    });
+
+    // Start background retention sweeper.
+    let sweeper_manifest = Arc::clone(&manifest);
+    let sweeper_minio = minio_config.clone();
+    let sweeper_shutdown = shutdown_tx.subscribe();
+    let sweeper_config = SweeperConfig {
+        hot_retention_secs: std::env::var("HOT_RETENTION_DAYS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(14)
+            * 86_400,
+        cold_retention_secs: std::env::var("COLD_RETENTION_DAYS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(90)
+            * 86_400,
+        superseded_grace_secs: std::env::var("SUPERSEDED_GRACE_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(600),
+        interval_secs: std::env::var("SWEEP_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(300),
+    };
+    tokio::spawn(async move {
+        if let Err(e) =
+            run_sweeper(sweeper_config, sweeper_manifest, sweeper_minio, sweeper_shutdown).await
+        {
+            tracing::error!("sweeper task exited with error: {e:#}");
         }
     });
 
@@ -1738,6 +1770,66 @@ mod tests {
             "threshold trigger should have compacted 5 small files; still {} active",
             active.len()
         );
+    }
+
+    #[tokio::test]
+    async fn sweeper_removes_expired_hot_files() {
+        use server::{run_sweeper, SweeperConfig};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("manifest.db");
+        let data_dir = dir.path().join("data");
+        let mut manifest = Manifest::open(&db_path).unwrap();
+
+        // Flush a file whose timestamp is ancient (1 000 ns — epoch + 1 µs).
+        let ancient_ts: i64 = 1_000;
+        let expired_event = LogEvent {
+            timestamp: ancient_ts,
+            level: Level::Info,
+            service: "svc".to_string(),
+            message: "ancient event".to_string(),
+            kafka_partition: 0,
+            kafka_offset: 0,
+            attributes: HashMap::new(),
+        };
+        flush_events(&[expired_event], &data_dir, &mut manifest).unwrap();
+
+        let files = manifest.active_files(None).unwrap();
+        assert_eq!(files.len(), 1);
+        let expired_path = files[0].path.clone();
+        assert!(std::path::Path::new(&expired_path).exists(), "file should be on disk before sweep");
+
+        let manifest_arc = Arc::new(Mutex::new(manifest));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+        let sweeper_manifest = Arc::clone(&manifest_arc);
+
+        tokio::spawn(async move {
+            let _ = run_sweeper(
+                SweeperConfig {
+                    // 1-second retention so the ancient file is immediately eligible.
+                    hot_retention_secs: 1,
+                    cold_retention_secs: 1,
+                    superseded_grace_secs: 600,
+                    interval_secs: 1,
+                },
+                sweeper_manifest,
+                MinioConfig::default(),
+                shutdown_rx,
+            )
+            .await;
+        });
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let _ = shutdown_tx.send(());
+
+        // File must be gone from disk.
+        assert!(
+            !std::path::Path::new(&expired_path).exists(),
+            "expired file should be deleted from disk by sweeper"
+        );
+        // File must be gone from manifest.
+        let remaining = manifest_arc.lock().await.active_files(None).unwrap();
+        assert_eq!(remaining.len(), 0, "expired file should be removed from manifest by sweeper");
     }
 
     /// Verify that buffer backpressure pauses and resumes the Kafka consumer without
