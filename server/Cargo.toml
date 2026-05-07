@@ -20,7 +20,7 @@ event-schema = { path = "../crates/event-schema" }
 manifest = { path = "../crates/manifest" }
 storage = { path = "../crates/storage" }
 batch-buffer = { path = "../crates/batch-buffer" }
-rdkafka = { version = "0.36", features = ["cmake-build"] }
+rdkafka = { version = "0.37", features = ["cmake-build"] }
 
 datafusion = "44"
 parquet = "53.4"
