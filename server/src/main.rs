@@ -58,6 +58,7 @@ enum JobState {
 struct JobEntry {
     state: JobState,
     cancel: tokio_util::sync::CancellationToken,
+    client_ip: std::net::IpAddr,
 }
 
 type JobStore = Arc<Mutex<HashMap<uuid::Uuid, JobEntry>>>;
@@ -84,6 +85,7 @@ struct AppState {
     jobs_dir: PathBuf,
     job_timeout_secs: u64,
     job_semaphore: Arc<Semaphore>,
+    per_client_queue_cap: usize,
 }
 
 async fn query_handler(
@@ -329,6 +331,7 @@ async fn run_job(state: AppState, req: QueryRequest, job_id: uuid::Uuid) -> Resu
 
 async fn submit_job_handler(
     State(state): State<AppState>,
+    maybe_addr: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
     Json(req): Json<QueryRequest>,
 ) -> Response {
     if req.time_from.is_none() || req.time_to.is_none() {
@@ -342,12 +345,35 @@ async fn submit_job_handler(
         .into_response();
     }
 
+    let client_ip: std::net::IpAddr = maybe_addr
+        .map(|c| c.0.ip())
+        .unwrap_or_else(|| std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+
+    {
+        let store = state.job_store.lock().await;
+        let queued = store.values()
+            .filter(|e| matches!(e.state, JobState::Queued) && e.client_ip == client_ip)
+            .count();
+        if queued >= state.per_client_queue_cap {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(header::RETRY_AFTER, "5")],
+                Json(serde_json::json!({
+                    "error": "per-client queue cap exceeded",
+                    "code": "queue_cap_exceeded",
+                    "cap": state.per_client_queue_cap,
+                })),
+            ).into_response();
+        }
+    }
+
     let job_id = uuid::Uuid::new_v4();
     let cancel = tokio_util::sync::CancellationToken::new();
     {
         state.job_store.lock().await.insert(job_id, JobEntry {
             state: JobState::Queued,
             cancel: cancel.clone(),
+            client_ip,
         });
     }
 
@@ -780,6 +806,11 @@ async fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(8usize);
 
+    let per_client_queue_cap = std::env::var("PER_CLIENT_QUEUE_CAP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5usize);
+
     let state = AppState {
         manifest,
         minio: minio_config,
@@ -789,6 +820,7 @@ async fn main() {
         jobs_dir,
         job_timeout_secs,
         job_semaphore: Arc::new(Semaphore::new(max_concurrent_jobs)),
+        per_client_queue_cap,
     };
     let app = Router::new()
         .route("/ingest", post(ingest_handler))
@@ -811,7 +843,7 @@ async fn main() {
     tracing::info!("listening on {}", listener.local_addr().unwrap());
 
     tokio::select! {
-        _ = axum::serve(listener, app) => {}
+        _ = axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()) => {}
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("ctrl-c received, shutting down");
             let _ = shutdown_tx.send(());
@@ -851,6 +883,7 @@ mod tests {
             jobs_dir,
             job_timeout_secs: 300,
             job_semaphore: Arc::new(Semaphore::new(8)),
+            per_client_queue_cap: 5,
         }
     }
 
@@ -1357,7 +1390,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Query and assert all N events are present.
-        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)), cold_cache: Arc::new(Mutex::new(ColdCache::new(std::env::temp_dir().join("log-ingest-test-cache"), 10 * 1024 * 1024 * 1024).unwrap())), job_store: Arc::new(Mutex::new(HashMap::new())), jobs_dir: std::env::temp_dir().join("log-ingest-test-jobs"), job_timeout_secs: 300, job_semaphore: Arc::new(Semaphore::new(8)) };
+        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)), cold_cache: Arc::new(Mutex::new(ColdCache::new(std::env::temp_dir().join("log-ingest-test-cache"), 10 * 1024 * 1024 * 1024).unwrap())), job_store: Arc::new(Mutex::new(HashMap::new())), jobs_dir: std::env::temp_dir().join("log-ingest-test-jobs"), job_timeout_secs: 300, job_semaphore: Arc::new(Semaphore::new(8)), per_client_queue_cap: 5 };
         let rows = query_rows(state, QueryRequest {
             sql: "SELECT * FROM logs".to_string(),
             time_from: Some(0),
@@ -1509,7 +1542,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // All N events must be present — none were permanently lost.
-        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)), cold_cache: Arc::new(Mutex::new(ColdCache::new(std::env::temp_dir().join("log-ingest-test-cache"), 10 * 1024 * 1024 * 1024).unwrap())), job_store: Arc::new(Mutex::new(HashMap::new())), jobs_dir: std::env::temp_dir().join("log-ingest-test-jobs"), job_timeout_secs: 300, job_semaphore: Arc::new(Semaphore::new(8)) };
+        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)), cold_cache: Arc::new(Mutex::new(ColdCache::new(std::env::temp_dir().join("log-ingest-test-cache"), 10 * 1024 * 1024 * 1024).unwrap())), job_store: Arc::new(Mutex::new(HashMap::new())), jobs_dir: std::env::temp_dir().join("log-ingest-test-jobs"), job_timeout_secs: 300, job_semaphore: Arc::new(Semaphore::new(8)), per_client_queue_cap: 5 };
         let rows = query_rows(state, QueryRequest {
             sql: "SELECT * FROM logs".to_string(),
             time_from: Some(0), time_to: Some(i64::MAX), limit: 1000,
@@ -1633,7 +1666,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // All N events must be present with no duplicates (unique by kafka_offset).
-        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)), cold_cache: Arc::new(Mutex::new(ColdCache::new(std::env::temp_dir().join("log-ingest-test-cache"), 10 * 1024 * 1024 * 1024).unwrap())), job_store: Arc::new(Mutex::new(HashMap::new())), jobs_dir: std::env::temp_dir().join("log-ingest-test-jobs"), job_timeout_secs: 300, job_semaphore: Arc::new(Semaphore::new(8)) };
+        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)), cold_cache: Arc::new(Mutex::new(ColdCache::new(std::env::temp_dir().join("log-ingest-test-cache"), 10 * 1024 * 1024 * 1024).unwrap())), job_store: Arc::new(Mutex::new(HashMap::new())), jobs_dir: std::env::temp_dir().join("log-ingest-test-jobs"), job_timeout_secs: 300, job_semaphore: Arc::new(Semaphore::new(8)), per_client_queue_cap: 5 };
         let rows = query_rows(
             state,
             QueryRequest {
@@ -1809,6 +1842,7 @@ mod tests {
             jobs_dir: std::env::temp_dir().join("log-ingest-test-jobs"),
             job_timeout_secs: 300,
             job_semaphore: Arc::new(Semaphore::new(8)),
+            per_client_queue_cap: 5,
         };
         let (rows, _stats) = query(
             state,
@@ -1888,6 +1922,7 @@ mod tests {
             jobs_dir: std::env::temp_dir().join("log-ingest-test-jobs"),
             job_timeout_secs: 300,
             job_semaphore: Arc::new(Semaphore::new(8)),
+            per_client_queue_cap: 5,
         };
 
         // First query — cache miss: file is downloaded from MinIO.
@@ -2232,6 +2267,7 @@ mod tests {
             jobs_dir,
             job_timeout_secs: 60,
             job_semaphore: Arc::new(Semaphore::new(8)),
+            per_client_queue_cap: 5,
         };
 
         let app = Router::new()
@@ -2385,6 +2421,7 @@ mod tests {
             jobs_dir,
             job_timeout_secs: 60,
             job_semaphore: Arc::clone(&job_semaphore),
+            per_client_queue_cap: 5,
         };
 
         let app = make_job_app(state);
@@ -2442,6 +2479,7 @@ mod tests {
             jobs_dir,
             job_timeout_secs: 60,
             job_semaphore: Arc::new(Semaphore::new(8)),
+            per_client_queue_cap: 5,
         };
 
         let app = make_job_app(state);
@@ -2493,6 +2531,7 @@ mod tests {
             jobs_dir,
             job_timeout_secs: 60,
             job_semaphore: Arc::new(Semaphore::new(8)),
+            per_client_queue_cap: 5,
         };
 
         let app = Router::new()
@@ -2550,6 +2589,71 @@ mod tests {
         let page2: serde_json::Value = serde_json::from_slice(&resp).unwrap();
         assert_eq!(page2["rows"].as_array().unwrap().len(), 1);
         assert_eq!(page2["rows"][0]["kafka_offset"], 4);
+    }
+
+    #[tokio::test]
+    async fn per_client_queue_cap_returns_429_on_sixth_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs_dir = dir.path().join("jobs");
+        std::fs::create_dir_all(&jobs_dir).unwrap();
+        let manifest = Manifest::open(&dir.path().join("manifest.db")).unwrap();
+
+        // Cap of 5; semaphore of 0 keeps every submitted job in Queued state.
+        let job_semaphore = Arc::new(Semaphore::new(0));
+        let state = AppState {
+            manifest: Arc::new(Mutex::new(manifest)),
+            minio: MinioConfig::default(),
+            cold_semaphore: Arc::new(Semaphore::new(4)),
+            cold_cache: Arc::new(Mutex::new(
+                ColdCache::new(dir.path().join("cache"), 10 * 1024 * 1024 * 1024).unwrap(),
+            )),
+            job_store: Arc::new(Mutex::new(HashMap::new())),
+            jobs_dir,
+            job_timeout_secs: 60,
+            job_semaphore: Arc::clone(&job_semaphore),
+            per_client_queue_cap: 5,
+        };
+
+        let app = make_job_app(state);
+
+        let body = serde_json::json!({
+            "sql": "SELECT 1", "time_from": 0, "time_to": i64::MAX, "limit": 1
+        });
+
+        // First 5 submissions must be accepted (202).
+        for i in 1..=5 {
+            let resp = app.clone().oneshot(
+                axum::http::Request::builder()
+                    .method("POST").uri("/jobs")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            ).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::ACCEPTED, "job {i} should be accepted");
+        }
+
+        // 6th submission must be rejected with 429 and Retry-After.
+        let resp = app.clone().oneshot(
+            axum::http::Request::builder()
+                .method("POST").uri("/jobs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap(),
+        ).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            resp.headers().contains_key(header::RETRY_AFTER),
+            "429 response must include Retry-After header"
+        );
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["code"], "queue_cap_exceeded");
+        assert_eq!(body["cap"], 5);
+
+        // Release the semaphore so the 5 queued jobs can eventually finish.
+        drop(job_semaphore);
     }
 
     /// Verify that buffer backpressure pauses and resumes the Kafka consumer without
@@ -2641,7 +2745,7 @@ mod tests {
             "expected at least one backpressure pause"
         );
 
-        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)), cold_cache: Arc::new(Mutex::new(ColdCache::new(std::env::temp_dir().join("log-ingest-test-cache"), 10 * 1024 * 1024 * 1024).unwrap())), job_store: Arc::new(Mutex::new(HashMap::new())), jobs_dir: std::env::temp_dir().join("log-ingest-test-jobs"), job_timeout_secs: 300, job_semaphore: Arc::new(Semaphore::new(8)) };
+        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)), cold_cache: Arc::new(Mutex::new(ColdCache::new(std::env::temp_dir().join("log-ingest-test-cache"), 10 * 1024 * 1024 * 1024).unwrap())), job_store: Arc::new(Mutex::new(HashMap::new())), jobs_dir: std::env::temp_dir().join("log-ingest-test-jobs"), job_timeout_secs: 300, job_semaphore: Arc::new(Semaphore::new(8)), per_client_queue_cap: 5 };
         let rows = query_rows(
             state,
             QueryRequest {
