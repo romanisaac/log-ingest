@@ -651,6 +651,20 @@ async fn main() {
         .install_recorder()
         .expect("failed to install Prometheus recorder");
 
+    metrics::describe_counter!("events_ingested_total", "Total log events written to Parquet.");
+    metrics::describe_histogram!("flush_duration_seconds", "Time to flush a partition batch to Parquet.");
+    metrics::describe_gauge!("buffer_occupancy_ratio", "Current fill ratio of each partition's batch buffer (0–1).");
+    metrics::describe_gauge!("kafka_consumer_lag", "Unconsumed messages between committed offset and high-watermark.");
+    metrics::describe_counter!("backpressure_pauses_total", "Times a Kafka partition was paused due to backpressure.");
+    metrics::describe_gauge!("files_active", "Number of active Parquet files by storage tier.");
+    metrics::describe_gauge!("files_compacting", "1 while a compaction run is in progress, 0 otherwise.");
+    metrics::describe_histogram!("query_duration_seconds", "End-to-end latency of streaming queries.");
+    metrics::describe_counter!("bytes_scanned_total", "Bytes of Parquet data scanned by queries.");
+    metrics::describe_gauge!("active_queries", "Number of queries currently streaming results.");
+    metrics::describe_counter!("rate_limit_rejected_total", "Job submissions rejected by the per-client queue cap.");
+    metrics::describe_counter!("cache_hits_total", "Cold-tier cache hits (file served from local disk).");
+    metrics::describe_counter!("cache_misses_total", "Cold-tier cache misses (file downloaded from MinIO).");
+
     let data_dir = PathBuf::from(
         std::env::var("DATA_DIR").unwrap_or_else(|_| "data".to_string()),
     );
