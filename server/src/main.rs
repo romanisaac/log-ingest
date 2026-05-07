@@ -164,13 +164,15 @@ async fn stream_query(
         .await
         .context("materialize view creation")?;
 
-    // Wrap the user query so the server-side cap applies even when the user includes their own LIMIT.
+    // Apply the server-side cap via the DataFrame API so it sits on top of the
+    // logical plan without discarding any ORDER BY the user included.
     let inner = req.sql.trim_end_matches(';').trim();
-    let final_sql = format!("SELECT * FROM ({inner}) AS _q LIMIT {}", req.limit);
     let batch_stream = ctx
-        .sql(&final_sql)
+        .sql(inner)
         .await
         .context("parse user sql")?
+        .limit(0, Some(req.limit as usize))
+        .context("apply server limit")?
         .execute_stream()
         .await
         .context("execute query")?;

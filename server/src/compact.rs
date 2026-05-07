@@ -78,11 +78,11 @@ pub async fn run_compaction(
                 .acquire_owned()
                 .await
                 .context("acquire semaphore for compaction")?;
-            metrics::gauge!("files_compacting").increment(1.0);
+            metrics::gauge!("files_compacting").set(1.0);
             if let Err(e) = compact_bucket(&service, &time_bucket, &config, &manifest).await {
                 tracing::warn!(service = %service, bucket = %time_bucket, "compaction failed: {e:#}");
             }
-            metrics::gauge!("files_compacting").decrement(1.0);
+            metrics::gauge!("files_compacting").set(0.0);
             drop(permit);
         }
     }
