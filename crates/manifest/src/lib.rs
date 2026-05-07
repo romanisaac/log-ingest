@@ -404,7 +404,6 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use tempfile::tempdir;
 
     fn insert_file(m: &mut Manifest, state: &str, max_ts: i64, superseded_at: i64) -> i64 {

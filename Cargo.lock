@@ -2052,6 +2052,8 @@ dependencies = [
  "anyhow",
  "rusqlite",
  "serde",
+ "tempfile",
+ "uuid",
 ]
 
 [[package]]
@@ -2712,6 +2714,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "rdkafka"
+version = "0.37.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "14b52c81ac3cac39c9639b95c20452076e74b8d9a71bc6fc4d83407af2ea6fff"
+dependencies = [
+ "futures-channel",
+ "futures-util",
+ "libc",
+ "log",
+ "rdkafka-sys",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "slab",
+ "tokio",
+]
+
+[[package]]
 name = "rdkafka-sys"
 version = "4.10.0+2.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3026,7 +3046,7 @@ dependencies = [
 name = "seed"
 version = "0.1.0"
 dependencies = [
- "rdkafka",
+ "rdkafka 0.36.2",
  "serde_json",
 ]
 
@@ -3127,7 +3147,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "object_store",
  "parquet",
- "rdkafka",
+ "rdkafka 0.37.0",
  "rust-embed",
  "serde",
  "serde_json",

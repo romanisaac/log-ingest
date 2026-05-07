@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -8,10 +9,10 @@ use arrow::array::{Array, BooleanArray, Int32Array, Int64Array, StringArray, Str
 use arrow::datatypes::DataType;
 use axum::{
     body::Body,
-    extract::State,
+    extract::{Path as AxumPath, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
 use bytes::Bytes;
@@ -45,11 +46,24 @@ struct QueryRequest {
 fn default_limit() -> usize { 1000 }
 
 #[derive(Clone)]
+enum JobState {
+    Queued,
+    Running,
+    Complete { result_count: usize, result_path: PathBuf },
+    Failed { error: String },
+}
+
+type JobStore = Arc<Mutex<HashMap<uuid::Uuid, JobState>>>;
+
+#[derive(Clone)]
 struct AppState {
     manifest: Arc<Mutex<Manifest>>,
     minio: MinioConfig,
     cold_semaphore: Arc<Semaphore>,
     cold_cache: Arc<Mutex<ColdCache>>,
+    job_store: JobStore,
+    jobs_dir: PathBuf,
+    job_timeout_secs: u64,
 }
 
 async fn query_handler(
@@ -259,6 +273,131 @@ fn arrow_value_to_json(col: &dyn Array, row: usize) -> Result<serde_json::Value>
     }
 }
 
+// ─── Async job queue ─────────────────────────────────────────────────────────
+
+async fn run_job(state: AppState, req: QueryRequest, job_id: uuid::Uuid) -> Result<usize> {
+    let result_path = state.jobs_dir.join(format!("{job_id}.ndjson"));
+    let stream = stream_query(state, req).await?;
+
+    let mut all_rows: Vec<serde_json::Value> = Vec::new();
+    futures::pin_mut!(stream);
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.map_err(|e| anyhow::anyhow!("{e}"))?;
+        for line in bytes.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) {
+                all_rows.push(v);
+            }
+        }
+    }
+
+    // Last element is always the stats object emitted by stream_query — drop it.
+    if !all_rows.is_empty() {
+        all_rows.pop();
+    }
+
+    let result_count = all_rows.len();
+
+    let content: String = all_rows
+        .iter()
+        .map(|r| r.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    tokio::fs::write(&result_path, content).await.context("write job results")?;
+
+    Ok(result_count)
+}
+
+async fn submit_job_handler(
+    State(state): State<AppState>,
+    Json(req): Json<QueryRequest>,
+) -> Response {
+    if req.time_from.is_none() || req.time_to.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "time_from and time_to are required",
+                "code": "missing_time_predicate"
+            })),
+        )
+        .into_response();
+    }
+
+    let job_id = uuid::Uuid::new_v4();
+    {
+        state.job_store.lock().await.insert(job_id, JobState::Queued);
+    }
+
+    let state_bg = state.clone();
+    tokio::spawn(async move {
+        {
+            state_bg.job_store.lock().await.insert(job_id, JobState::Running);
+        }
+
+        let timeout = Duration::from_secs(state_bg.job_timeout_secs);
+        let new_state = match tokio::time::timeout(timeout, run_job(state_bg.clone(), req, job_id)).await {
+            Err(_) => JobState::Failed {
+                error: format!("job timed out after {} seconds", state_bg.job_timeout_secs),
+            },
+            Ok(Err(e)) => JobState::Failed { error: format!("{e:#}") },
+            Ok(Ok(result_count)) => JobState::Complete {
+                result_count,
+                result_path: state_bg.jobs_dir.join(format!("{job_id}.ndjson")),
+            },
+        };
+
+        state_bg.job_store.lock().await.insert(job_id, new_state);
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "job_id": job_id.to_string() })),
+    )
+    .into_response()
+}
+
+async fn poll_job_handler(
+    State(state): State<AppState>,
+    AxumPath(id_str): AxumPath<String>,
+) -> Response {
+    let job_id = match id_str.parse::<uuid::Uuid>() {
+        Ok(id) => id,
+        Err(_) => return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "invalid job id" })),
+        ).into_response(),
+    };
+    let job_state = state.job_store.lock().await.get(&job_id).cloned();
+
+    match job_state {
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "job not found" })),
+        )
+        .into_response(),
+        Some(JobState::Queued) => Json(serde_json::json!({ "state": "queued" })).into_response(),
+        Some(JobState::Running) => Json(serde_json::json!({ "state": "running" })).into_response(),
+        Some(JobState::Failed { error }) => {
+            Json(serde_json::json!({ "state": "failed", "error": error })).into_response()
+        }
+        Some(JobState::Complete { result_count, result_path }) => {
+            let rows: Vec<serde_json::Value> = match tokio::fs::read_to_string(&result_path).await {
+                Err(_) => vec![],
+                Ok(content) => content
+                    .lines()
+                    .filter(|l| !l.is_empty())
+                    .filter_map(|l| serde_json::from_str(l).ok())
+                    .collect(),
+            };
+            Json(serde_json::json!({
+                "state": "complete",
+                "result_count": result_count,
+                "rows": rows,
+            }))
+            .into_response()
+        }
+    }
+}
+
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -434,14 +573,29 @@ async fn main() {
     let cold_cache = Arc::new(Mutex::new(
         ColdCache::new(cold_cache_dir, cold_cache_max_bytes).expect("create cold cache"),
     ));
+    let jobs_dir = PathBuf::from(
+        std::env::var("JOBS_DIR").unwrap_or_else(|_| "jobs".to_string()),
+    );
+    std::fs::create_dir_all(&jobs_dir).expect("create jobs dir");
+
+    let job_timeout_secs = std::env::var("JOB_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(300u64);
+
     let state = AppState {
         manifest,
         minio: minio_config,
         cold_semaphore: Arc::new(Semaphore::new(cold_concurrency)),
         cold_cache,
+        job_store: Arc::new(Mutex::new(HashMap::new())),
+        jobs_dir,
+        job_timeout_secs,
     };
     let app = Router::new()
         .route("/query", post(query_handler))
+        .route("/jobs", post(submit_job_handler))
+        .route("/jobs/:id", get(poll_job_handler))
         .route("/health", axum::routing::get(|| async { "ok" }))
         .route("/metrics", axum::routing::get({
             let handle = prometheus_handle.clone();
@@ -480,6 +634,8 @@ mod tests {
     use tower::util::ServiceExt;
 
     fn make_state(manifest: Manifest) -> AppState {
+        let jobs_dir = std::env::temp_dir().join("log-ingest-test-jobs");
+        std::fs::create_dir_all(&jobs_dir).ok();
         AppState {
             manifest: Arc::new(Mutex::new(manifest)),
             minio: MinioConfig::default(),
@@ -491,6 +647,9 @@ mod tests {
                 )
                 .expect("create test cold cache"),
             )),
+            job_store: Arc::new(Mutex::new(HashMap::new())),
+            jobs_dir,
+            job_timeout_secs: 300,
         }
     }
 
@@ -997,7 +1156,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Query and assert all N events are present.
-        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)), cold_cache: Arc::new(Mutex::new(ColdCache::new(std::env::temp_dir().join("log-ingest-test-cache"), 10 * 1024 * 1024 * 1024).unwrap())) };
+        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)), cold_cache: Arc::new(Mutex::new(ColdCache::new(std::env::temp_dir().join("log-ingest-test-cache"), 10 * 1024 * 1024 * 1024).unwrap())), job_store: Arc::new(Mutex::new(HashMap::new())), jobs_dir: std::env::temp_dir().join("log-ingest-test-jobs"), job_timeout_secs: 300 };
         let rows = query_rows(state, QueryRequest {
             sql: "SELECT * FROM logs".to_string(),
             time_from: Some(0),
@@ -1149,7 +1308,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // All N events must be present — none were permanently lost.
-        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)), cold_cache: Arc::new(Mutex::new(ColdCache::new(std::env::temp_dir().join("log-ingest-test-cache"), 10 * 1024 * 1024 * 1024).unwrap())) };
+        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)), cold_cache: Arc::new(Mutex::new(ColdCache::new(std::env::temp_dir().join("log-ingest-test-cache"), 10 * 1024 * 1024 * 1024).unwrap())), job_store: Arc::new(Mutex::new(HashMap::new())), jobs_dir: std::env::temp_dir().join("log-ingest-test-jobs"), job_timeout_secs: 300 };
         let rows = query_rows(state, QueryRequest {
             sql: "SELECT * FROM logs".to_string(),
             time_from: Some(0), time_to: Some(i64::MAX), limit: 1000,
@@ -1273,7 +1432,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // All N events must be present with no duplicates (unique by kafka_offset).
-        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)), cold_cache: Arc::new(Mutex::new(ColdCache::new(std::env::temp_dir().join("log-ingest-test-cache"), 10 * 1024 * 1024 * 1024).unwrap())) };
+        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)), cold_cache: Arc::new(Mutex::new(ColdCache::new(std::env::temp_dir().join("log-ingest-test-cache"), 10 * 1024 * 1024 * 1024).unwrap())), job_store: Arc::new(Mutex::new(HashMap::new())), jobs_dir: std::env::temp_dir().join("log-ingest-test-jobs"), job_timeout_secs: 300 };
         let rows = query_rows(
             state,
             QueryRequest {
@@ -1445,6 +1604,9 @@ mod tests {
             minio: MinioConfig::default(),
             cold_semaphore: Arc::new(Semaphore::new(4)),
             cold_cache: Arc::new(Mutex::new(ColdCache::new(cache_dir, 10 * 1024 * 1024 * 1024).unwrap())),
+            job_store: Arc::new(Mutex::new(HashMap::new())),
+            jobs_dir: std::env::temp_dir().join("log-ingest-test-jobs"),
+            job_timeout_secs: 300,
         };
         let (rows, _stats) = query(
             state,
@@ -1520,6 +1682,9 @@ mod tests {
             cold_cache: Arc::new(Mutex::new(
                 ColdCache::new(cache_dir.clone(), 10 * 1024 * 1024 * 1024).unwrap(),
             )),
+            job_store: Arc::new(Mutex::new(HashMap::new())),
+            jobs_dir: std::env::temp_dir().join("log-ingest-test-jobs"),
+            job_timeout_secs: 300,
         };
 
         // First query — cache miss: file is downloaded from MinIO.
@@ -1832,6 +1997,118 @@ mod tests {
         assert_eq!(remaining.len(), 0, "expired file should be removed from manifest by sweeper");
     }
 
+    #[tokio::test]
+    async fn submit_and_poll_job_matches_direct_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("manifest.db");
+        let data_dir = dir.path().join("data");
+        let jobs_dir = dir.path().join("jobs");
+        std::fs::create_dir_all(&jobs_dir).unwrap();
+
+        let mut manifest = Manifest::open(&db_path).unwrap();
+
+        let make = |ts: i64, offset: i64| LogEvent {
+            timestamp: ts,
+            level: Level::Info,
+            service: "svc".to_string(),
+            message: "job test".to_string(),
+            kafka_partition: 0,
+            kafka_offset: offset,
+            attributes: HashMap::new(),
+        };
+        flush_events(&[make(1_000, 0), make(2_000, 1), make(3_000, 2)], &data_dir, &mut manifest).unwrap();
+
+        let state = AppState {
+            manifest: Arc::new(Mutex::new(manifest)),
+            minio: MinioConfig::default(),
+            cold_semaphore: Arc::new(Semaphore::new(4)),
+            cold_cache: Arc::new(Mutex::new(
+                ColdCache::new(dir.path().join("cache"), 10 * 1024 * 1024 * 1024).unwrap(),
+            )),
+            job_store: Arc::new(Mutex::new(HashMap::new())),
+            jobs_dir,
+            job_timeout_secs: 60,
+        };
+
+        let app = Router::new()
+            .route("/query", post(query_handler))
+            .route("/jobs", post(submit_job_handler))
+            .route("/jobs/:id", get(poll_job_handler))
+            .with_state(state);
+
+        let query_body = serde_json::json!({
+            "sql": "SELECT kafka_offset FROM logs ORDER BY kafka_offset",
+            "time_from": 0,
+            "time_to": i64::MAX,
+            "limit": 100
+        });
+
+        // Reference result via direct query.
+        let direct_bytes = axum::body::to_bytes(
+            app.clone().oneshot(
+                axum::http::Request::builder()
+                    .method("POST").uri("/query")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(query_body.to_string()))
+                    .unwrap(),
+            ).await.unwrap().into_body(),
+            usize::MAX,
+        ).await.unwrap();
+        let mut direct_rows: Vec<serde_json::Value> = direct_bytes
+            .split(|&b| b == b'\n')
+            .filter(|l| !l.is_empty())
+            .filter_map(|l| serde_json::from_slice(l).ok())
+            .collect();
+        direct_rows.pop(); // remove trailing stats line
+
+        // Submit job — must return immediately with a job_id.
+        let t0 = std::time::Instant::now();
+        let submit_bytes = axum::body::to_bytes(
+            app.clone().oneshot(
+                axum::http::Request::builder()
+                    .method("POST").uri("/jobs")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(query_body.to_string()))
+                    .unwrap(),
+            ).await.unwrap().into_body(),
+            usize::MAX,
+        ).await.unwrap();
+        assert!(t0.elapsed().as_millis() < 50, "POST /jobs must return in < 50ms");
+
+        let submit_json: serde_json::Value = serde_json::from_slice(&submit_bytes).unwrap();
+        let job_id = submit_json["job_id"].as_str().expect("job_id missing").to_string();
+
+        // Poll until complete (up to 5 s).
+        let mut job_result = None;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let poll_bytes = axum::body::to_bytes(
+                app.clone().oneshot(
+                    axum::http::Request::builder()
+                        .method("GET").uri(format!("/jobs/{job_id}"))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                ).await.unwrap().into_body(),
+                usize::MAX,
+            ).await.unwrap();
+            let poll_json: serde_json::Value = serde_json::from_slice(&poll_bytes).unwrap();
+            match poll_json["state"].as_str().unwrap() {
+                "complete" => { job_result = Some(poll_json); break; }
+                "failed" => panic!("job failed: {}", poll_json["error"]),
+                _ => {}
+            }
+        }
+
+        let job_result = job_result.expect("job did not complete within 5 s");
+        assert_eq!(job_result["result_count"].as_u64().unwrap(), 3);
+
+        let job_rows = job_result["rows"].as_array().unwrap();
+        assert_eq!(job_rows.len(), direct_rows.len(), "job row count must match direct query");
+        for (job_row, direct_row) in job_rows.iter().zip(direct_rows.iter()) {
+            assert_eq!(job_row["kafka_offset"], direct_row["kafka_offset"]);
+        }
+    }
+
     /// Verify that buffer backpressure pauses and resumes the Kafka consumer without
     /// dropping events. Uses a tiny batch buffer (500 bytes) so that two events
     /// (~240 bytes each) push occupancy above the 0.8 high-water mark, triggering
@@ -1921,7 +2198,7 @@ mod tests {
             "expected at least one backpressure pause"
         );
 
-        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)), cold_cache: Arc::new(Mutex::new(ColdCache::new(std::env::temp_dir().join("log-ingest-test-cache"), 10 * 1024 * 1024 * 1024).unwrap())) };
+        let state = AppState { manifest, minio: MinioConfig::default(), cold_semaphore: Arc::new(Semaphore::new(4)), cold_cache: Arc::new(Mutex::new(ColdCache::new(std::env::temp_dir().join("log-ingest-test-cache"), 10 * 1024 * 1024 * 1024).unwrap())), job_store: Arc::new(Mutex::new(HashMap::new())), jobs_dir: std::env::temp_dir().join("log-ingest-test-jobs"), job_timeout_secs: 300 };
         let rows = query_rows(
             state,
             QueryRequest {
