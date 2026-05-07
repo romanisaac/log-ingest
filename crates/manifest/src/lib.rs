@@ -70,12 +70,20 @@ impl Manifest {
                 record_count      INTEGER NOT NULL,
                 state             TEXT NOT NULL DEFAULT 'active',
                 min_kafka_offset  INTEGER NOT NULL,
-                max_kafka_offset  INTEGER NOT NULL
+                max_kafka_offset  INTEGER NOT NULL,
+                superseded_at     INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_files_covering
                 ON files (service, time_bucket, min_ts, max_ts);",
         )
         .context("create schema")?;
+
+        // Migrate existing databases that pre-date the superseded_at column.
+        // ALTER TABLE ADD COLUMN fails with "duplicate column name" if the column
+        // already exists — that error is intentionally ignored.
+        let _ = conn.execute_batch(
+            "ALTER TABLE files ADD COLUMN superseded_at INTEGER NOT NULL DEFAULT 0;",
+        );
 
         Ok(Manifest { conn })
     }
@@ -228,7 +236,7 @@ impl Manifest {
         }
         for &id in old_ids {
             tx.execute(
-                "UPDATE files SET state = 'superseded' WHERE id = ?1",
+                "UPDATE files SET state = 'superseded', superseded_at = unixepoch() WHERE id = ?1",
                 params![id],
             )
             .context("mark file superseded")?;
@@ -314,6 +322,66 @@ impl Manifest {
             .context("query active_files")?;
         rows.collect::<std::result::Result<_, _>>().context("collect rows")
     }
+
+    /// Return active files older than the given retention cutoffs (nanosecond timestamps).
+    /// Hot and cold tiers may have different retention windows.
+    pub fn expired_active_files(
+        &self,
+        hot_cutoff_ns: i64,
+        cold_cutoff_ns: i64,
+    ) -> Result<Vec<FileEntry>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, path, tier, service, time_bucket, min_ts, max_ts,
+                        size_bytes, record_count, state, min_kafka_offset, max_kafka_offset
+                 FROM files
+                 WHERE state = 'active'
+                   AND ((tier = 'hot'  AND max_ts < ?1)
+                     OR (tier = 'cold' AND max_ts < ?2))",
+            )
+            .context("prepare expired_active_files")?;
+        let rows = stmt
+            .query_map(params![hot_cutoff_ns, cold_cutoff_ns], map_row)
+            .context("query expired_active_files")?
+            .collect::<std::result::Result<_, _>>()
+            .context("collect rows")?;
+        Ok(rows)
+    }
+
+    /// Return superseded files whose superseded_at timestamp is before `grace_cutoff_unix_secs`.
+    /// Files with superseded_at = 0 (pre-migration) are excluded to avoid mass-deleting
+    /// files that were superseded before the column existed.
+    pub fn superseded_files_past_grace(
+        &self,
+        grace_cutoff_unix_secs: i64,
+    ) -> Result<Vec<FileEntry>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, path, tier, service, time_bucket, min_ts, max_ts,
+                        size_bytes, record_count, state, min_kafka_offset, max_kafka_offset
+                 FROM files
+                 WHERE state = 'superseded'
+                   AND superseded_at > 0
+                   AND superseded_at < ?1",
+            )
+            .context("prepare superseded_files_past_grace")?;
+        let rows = stmt
+            .query_map(params![grace_cutoff_unix_secs], map_row)
+            .context("query superseded_files_past_grace")?
+            .collect::<std::result::Result<_, _>>()
+            .context("collect rows")?;
+        Ok(rows)
+    }
+
+    /// Remove a file entry from the manifest by id.
+    pub fn delete_file(&mut self, id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM files WHERE id = ?1", params![id])
+            .context("delete_file")?;
+        Ok(())
+    }
 }
 
 fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileEntry> {
@@ -331,4 +399,68 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileEntry> {
         min_kafka_offset: row.get(10)?,
         max_kafka_offset: row.get(11)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use tempfile::tempdir;
+
+    fn insert_file(m: &mut Manifest, state: &str, max_ts: i64, superseded_at: i64) -> i64 {
+        m.conn.execute(
+            "INSERT INTO files
+                (path, tier, service, time_bucket, min_ts, max_ts,
+                 size_bytes, record_count, state, min_kafka_offset, max_kafka_offset, superseded_at)
+             VALUES (?, 'hot', 'svc', '2024-01-01-00', 0, ?, 0, 0, ?, 0, 0, ?)",
+            rusqlite::params![
+                format!("/tmp/fake-{}.parquet", uuid::Uuid::new_v4()),
+                max_ts, state, superseded_at
+            ],
+        ).unwrap();
+        m.conn.last_insert_rowid()
+    }
+
+    #[test]
+    fn expired_active_files_returns_only_expired() {
+        let dir = tempdir().unwrap();
+        let mut m = Manifest::open(&dir.path().join("m.db")).unwrap();
+
+        let old_id = insert_file(&mut m, "active", 1_000, 0);       // ancient
+        let _new_id = insert_file(&mut m, "active", i64::MAX, 0);    // far future
+
+        let expired = m.expired_active_files(1_000_000_000, i64::MAX).unwrap();
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].id, old_id);
+    }
+
+    #[test]
+    fn superseded_files_past_grace_excludes_recent_and_legacy() {
+        let dir = tempdir().unwrap();
+        let mut m = Manifest::open(&dir.path().join("m.db")).unwrap();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+
+        let old_id = insert_file(&mut m, "superseded", 0, now - 3600); // 1h ago
+        let _recent = insert_file(&mut m, "superseded", 0, now);        // just now
+        let _legacy = insert_file(&mut m, "superseded", 0, 0);          // pre-migration default
+
+        let grace_cutoff = now - 600; // 10-minute grace
+        let eligible = m.superseded_files_past_grace(grace_cutoff).unwrap();
+        assert_eq!(eligible.len(), 1);
+        assert_eq!(eligible[0].id, old_id);
+    }
+
+    #[test]
+    fn delete_file_removes_row() {
+        let dir = tempdir().unwrap();
+        let mut m = Manifest::open(&dir.path().join("m.db")).unwrap();
+        let id = insert_file(&mut m, "active", 1000, 0);
+        m.delete_file(id).unwrap();
+        let count: i64 = m.conn
+            .query_row("SELECT COUNT(*) FROM files WHERE id = ?1", rusqlite::params![id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
 }
