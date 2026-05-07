@@ -8,7 +8,7 @@ use anyhow::Result;
 use batch_buffer::{BatchBuffer, SystemClock, DEFAULT_MAX_AGE_MS, DEFAULT_MAX_RECORDS};
 use event_schema::LogEvent;
 use manifest::Manifest;
-use rdkafka::consumer::{CommitMode, Consumer, ConsumerContext, Rebalance, StreamConsumer};
+use rdkafka::consumer::{BaseConsumer, CommitMode, Consumer, ConsumerContext, Rebalance, StreamConsumer};
 use rdkafka::message::Message;
 use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
 use rdkafka::{ClientConfig, ClientContext};
@@ -94,7 +94,7 @@ struct RebalanceContext {
 impl ClientContext for RebalanceContext {}
 
 impl ConsumerContext for RebalanceContext {
-    fn pre_rebalance<'a>(&self, rebalance: &Rebalance<'a>) {
+    fn pre_rebalance(&self, _base_consumer: &BaseConsumer<Self>, rebalance: &Rebalance<'_>) {
         let Rebalance::Revoke(tpl) = rebalance else {
             return;
         };
@@ -138,7 +138,7 @@ impl ConsumerContext for RebalanceContext {
         }
     }
 
-    fn post_rebalance<'a>(&self, rebalance: &Rebalance<'a>) {
+    fn post_rebalance(&self, _base_consumer: &BaseConsumer<Self>, rebalance: &Rebalance<'_>) {
         match rebalance {
             Rebalance::Assign(tpl) => {
                 let partitions: Vec<i32> = tpl.elements().iter().map(|e| e.partition()).collect();
