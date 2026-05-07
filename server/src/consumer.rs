@@ -201,8 +201,15 @@ pub async fn run_consumer(
         .create_with_context(ctx)?;
 
     consumer.subscribe(&[&config.topic])?;
-    consumer_ready.store(true, Ordering::Release);
-    tracing::info!("consumer subscribed to topic '{}'", config.topic);
+    // fetch_metadata actually connects to the broker; subscribe() alone is local-only.
+    // Only signal ready after confirming the broker is reachable.
+    match consumer.client().fetch_metadata(None, Duration::from_secs(10)) {
+        Ok(_) => {
+            consumer_ready.store(true, Ordering::Release);
+            tracing::info!("consumer subscribed to topic '{}' — broker reachable", config.topic);
+        }
+        Err(e) => tracing::warn!("consumer subscribed but broker not yet reachable: {e}"),
+    }
 
     let mut tick = interval(Duration::from_millis(100));
 
