@@ -337,8 +337,17 @@ export default function Home() {
   const cancelJob = useCallback(async () => {
     if (!job) return;
     stopPolling();
-    await fetch(`/jobs/${job.id}`, { method: 'DELETE' }).catch(() => {});
-    setJob(prev => prev ? { ...prev, state: 'cancelled' } : null);
+    try {
+      const res = await fetch(`/jobs/${job.id}`, { method: 'DELETE' });
+      if (res.status === 204) {
+        setJob(prev => prev ? { ...prev, state: 'cancelled' } : null);
+      } else {
+        const body = await res.json().catch(() => ({}));
+        setError({ message: body.error ?? `Cancel failed (HTTP ${res.status})` });
+      }
+    } catch (e) {
+      setError({ message: `Cancel failed: ${String(e)}` });
+    }
     setLoading(false);
   }, [job, stopPolling]);
 

@@ -401,10 +401,14 @@ async fn submit_job_handler(
     tokio::spawn(async move {
         // Acquire a semaphore permit before running; this bounds concurrency and
         // ensures the permit is released on completion, failure, timeout, or cancel.
-        let _permit = Arc::clone(&state_bg.job_semaphore)
-            .acquire_owned()
-            .await
-            .expect("job semaphore closed");
+        // Also select on cancel so DELETE while queued terminates this task cleanly.
+        let _permit = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            permit = Arc::clone(&state_bg.job_semaphore).acquire_owned() => {
+                permit.expect("job semaphore closed")
+            }
+        };
 
         {
             let mut store = state_bg.job_store.lock().await;
