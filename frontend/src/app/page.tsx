@@ -691,10 +691,10 @@ export default function Home() {
           </div>
         )}
 
-        {/* Stats bar (inline query only) */}
-        {!asyncMode && (stats || (loading && rows !== null && rows.length > 0)) && (
+        {/* Row count + inline stats */}
+        {rows !== null && rows.length > 0 && (
           <div className="shrink-0 flex items-center gap-4 text-xs text-gray-500">
-            <span className="text-gray-300 font-medium">{rows?.length ?? 0} rows{loading ? '…' : ''}</span>
+            <span className="text-gray-300 font-medium">{rows.length.toLocaleString()} rows{loading ? '…' : ''}</span>
             {stats && (
               <>
                 <span>{stats.rows_scanned.toLocaleString()} scanned</span>
@@ -703,13 +703,6 @@ export default function Home() {
                 <span>{stats.duration_ms} ms</span>
               </>
             )}
-          </div>
-        )}
-
-        {/* Row count while async results load */}
-        {asyncMode && rows !== null && rows.length > 0 && (
-          <div className="shrink-0 text-xs text-gray-500">
-            <span className="text-gray-300 font-medium">{rows.length.toLocaleString()} rows{loading ? '…' : ''}</span>
           </div>
         )}
 
