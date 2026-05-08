@@ -351,7 +351,7 @@ export default function Home() {
     setLoading(false);
   }, [job, stopPolling]);
 
-  const downloadCsv = useCallback(async (id: string) => {
+  const downloadCsv = useCallback(async (id?: string) => {
     const currentRows = rows;
     if (!currentRows?.length) return;
 
@@ -368,7 +368,7 @@ export default function Home() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `job-${id.slice(0, 8)}.csv`;
+    a.download = id ? `job-${id.slice(0, 8)}.csv` : `query-${Date.now()}.csv`;
     a.click();
     URL.revokeObjectURL(url);
   }, [rows]);
@@ -653,8 +653,8 @@ export default function Home() {
               )}
 
               {/* Download CSV */}
-              {job?.state === 'complete' && !!rows?.length && (
-                <button onClick={() => downloadCsv(job.id)} className="px-4 py-1.5 rounded border border-green-700 hover:border-green-500 text-green-400 hover:text-green-300 text-sm font-medium transition-colors">
+              {!!rows?.length && !loading && (
+                <button onClick={() => downloadCsv(job?.id)} className="px-4 py-1.5 rounded border border-green-700 hover:border-green-500 text-green-400 hover:text-green-300 text-sm font-medium transition-colors">
                   Download CSV
                 </button>
               )}
