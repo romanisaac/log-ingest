@@ -644,7 +644,7 @@ export default function Home() {
               )}
 
               {/* Download CSV */}
-              {asyncMode && job?.state === 'complete' && !!rows?.length && (
+              {job?.state === 'complete' && !!rows?.length && (
                 <button onClick={() => downloadCsv(job.id)} className="px-4 py-1.5 rounded border border-green-700 hover:border-green-500 text-green-400 hover:text-green-300 text-sm font-medium transition-colors">
                   Download CSV
                 </button>
